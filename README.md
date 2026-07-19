@@ -132,6 +132,12 @@ measured on real tensors above. This is not a hard gate for Task 3.1 (Task 3.2 o
 actual kill-criterion) — reported honestly per the task brief. Full breakdown, commands,
 and diagnosis: `.superpowers/sdd/task-3.1-report.md`.
 
+Not judged "OpenCL decepciona" (the plan's condition for the documented ONNX-ScatterND
+Alternative B, not implemented): the kernel is still a real, reproducible net win over CPU
+at every shape (1.0x–4.4x, never a regression), and splat was already <1.1s of the ≈8.5–17s
+total pipeline time (Task 2.2) — missing the per-call target doesn't change the project's
+actual bottleneck, which is GMFlow, not splat. Alternative B stays documented-only.
+
 \* MetricNet's legacy JIT exporter trips on `aten::l1_loss`; exported via `dynamo=True`
 instead. Its DirectML session needs `graph_optimization_level = ORT_DISABLE_ALL` — the
 default fused DML kernel reproducibly hangs the GPU after ~3 calls on this hardware/driver

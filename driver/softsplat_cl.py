@@ -143,8 +143,6 @@ def _splat_softmax_gpu(
     tenFlow: np.ndarray,
     tenMetric: np.ndarray,
 ) -> np.ndarray:
-    import pyopencl as cl
-
     ten_in = np.ascontiguousarray(tenIn, dtype=np.float32)
     ten_flow = np.ascontiguousarray(tenFlow, dtype=np.float32)
     ten_metric = np.ascontiguousarray(tenMetric, dtype=np.float32)
