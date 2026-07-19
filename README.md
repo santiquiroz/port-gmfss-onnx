@@ -90,6 +90,48 @@ practice GMFlow's transformer-attention cost dominates instead, on both provider
 splat stays under ~1.1s everywhere, so Phase 3's OpenCL splat kernel alone will not close
 the gap to the plan's fps target; GMFlow is the larger lever.
 
+### OpenCL splat kernel (Task 3.1)
+
+`driver/kernels/splat.cl` + `driver/softsplat_cl.py` add a GPU-accelerated *alternative*
+backend for the same softmax splat, gated behind optional `pyopencl`
+(`toolkit/requirements-gpu-splat.txt`) with automatic, warn-once fallback to the CPU
+`splat_softmax` if OpenCL is unavailable or fails to compile/run. `driver/softsplat.py`
+stays the correctness reference and default; nothing else in the repo requires `pyopencl`.
+Bilinear scatter-add uses one work-item per source pixel and an `atomic_cmpxchg`
+CAS-loop-on-reinterpreted-bits for float accumulation — this AMD driver (RX 7800 XT,
+OpenCL 2.1) exposes no native float-atomic extension, only the standard
+`cl_khr_global_int32_base_atomics`.
+
+Correctness: all 24 real call-site combinations (8 splat calls × 3 golden pairs) match
+`driver.softsplat.splat_softmax` at whole-tensor L2 relative error ≈5×10⁻⁸ — far under the
+brief's 1e-5 tolerance (max single-element abs diff ≈4.8×10⁻⁷, i.e. float32-epsilon level;
+see `tests/test_softsplat_cl.py` for why per-element relative error is the wrong metric
+here — some feature-map elements are near zero, same outlier-domination issue already
+noted above for end-to-end rel-err).
+
+Isolated kernel bench (RX 7800 XT, real call-site tensor shapes, 30 timed iterations + 3
+warmup, `toolkit/bench_splat_cl.py`), against the brief's <20ms/call target and the CPU
+reference at the same synthetic shapes:
+
+| Call site(s) | Shape | GPU mean | CPU mean (same shape) | Speedup | vs <20ms target |
+|---|---|---|---|---|---|
+| I1t / I2t | (1,3,544,960) | 9.73ms | 42.56ms | 4.4x | **HIT** |
+| feat\*t1 (pyramid scale1) | (1,64,544,960) | 154.10ms | 289.92ms | 1.9x | MISS |
+| feat\*t2 (pyramid scale2) | (1,128,272,480) | 82.48ms | 112.97ms | 1.4x | MISS |
+| feat\*t3 (pyramid scale3) | (1,192,136,240) | 31.19ms | 30.26ms | ~1.0x | MISS |
+
+Only the 2 lowest-channel-count calls (I1t/I2t, 3 channels) hit the <20ms target; the 6
+feature-pyramid calls (64–192 channels) miss it. Root cause: kernel time scales with total
+atomic-op count (`channels × H × W`), not resolution alone, and roughly half of the
+higher-channel calls' wall time is the numpy `exp`/multiply/concat/normalize pre- and
+post-processing around the kernel (kept in Python per this task's design, mirroring
+`driver/softsplat.py` — see the report below for the upload/kernel/download/numpy
+breakdown). Aggregate across all 8 real calls/frame: ≈555ms GPU vs ≈950–1050ms CPU at
+matching synthetic shapes (≈1.7–1.9x), consistent with the ≈1.03–1.05s CPU total already
+measured on real tensors above. This is not a hard gate for Task 3.1 (Task 3.2 owns the
+actual kill-criterion) — reported honestly per the task brief. Full breakdown, commands,
+and diagnosis: `.superpowers/sdd/task-3.1-report.md`.
+
 \* MetricNet's legacy JIT exporter trips on `aten::l1_loss`; exported via `dynamo=True`
 instead. Its DirectML session needs `graph_optimization_level = ORT_DISABLE_ALL` — the
 default fused DML kernel reproducibly hangs the GPU after ~3 calls on this hardware/driver

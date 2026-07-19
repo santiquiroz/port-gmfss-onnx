@@ -1,0 +1,15 @@
+# Optional extra for Task 3.1's OpenCL splat kernel (driver/softsplat_cl.py).
+# NOT part of the base toolkit env (toolkit/requirements.txt) -- pyopencl is
+# only needed to exercise the GPU backend; everything else in this repo
+# (including driver/softsplat.py's CPU reference) has zero dependency on it.
+# driver/softsplat_cl.splat_softmax() falls back to the CPU implementation
+# automatically (with a one-time warning) if this is not installed.
+#
+# Install into the toolkit venv with:
+#   .venv/Scripts/python.exe -m pip install -r toolkit/requirements-gpu-splat.txt
+#
+# Requires an OpenCL 1.1+ ICD/driver for the target GPU to actually be usable
+# at runtime (pip install alone does not provide one) -- see
+# .superpowers/sdd/task-3.1-report.md for the AMD driver this was validated
+# against.
+pyopencl==2026.1.2
