@@ -61,14 +61,34 @@ OpenCL splat kernel:
 
 | Graphs on | fps | s/frame |
 |---|---|---|
-| CPU-EP | 0.058 | 17.2 |
-| DirectML | 0.119 | 8.4 |
+| CPU-EP | 0.058–0.060 | 16.7–17.3 |
+| DirectML | 0.117 | 8.5 |
 
-Both are below the plan's 0.2–0.6 fps estimate. Root cause (profiled, not guessed): GMFlow
-— called twice per pair for flow01/flow10 — is 56–78% of total time by itself (≈9s of
-≈11–17s), even on DirectML; the 8 CPU splat calls together take under 1s. The plan's
-estimate assumed CPU splat would dominate; in practice GMFlow's transformer-attention cost
-dominates instead, on both providers.
+Both are below the plan's 0.2–0.6 fps estimate. Root cause, backed by a committed,
+reproducible per-stage profiler (`toolkit/profile_pipeline.py` — reuses
+`toolkit/validate_driver.py`'s warmed-session `make_run_graph()`, times each stage
+`GmfssDriver.interpolate_pair()` calls internally) rather than the ad hoc one-off
+instrumented run this section previously cited: GMFlow — called twice per pair for
+flow01/flow10 — is **55.6% of total time on CPU-EP and 71–74% on DirectML** (two runs
+measured, `vf_t006`), even though the 8 CPU splat calls together take ~1s on both
+providers. Full per-stage breakdown, both providers (`.venv/Scripts/python.exe
+toolkit/profile_pipeline.py`):
+
+| Stage | CPU-EP | DirectML |
+|---|---|---|
+| featurenet (×2) | 0.852–0.882s (5.1%) | 0.136–0.222s (1.6–2.6%) |
+| gmflow (×2) | 9.294–9.615s (55.6%) | 6.090–6.349s (71.4–74.4%) |
+| metricnet (×1) | 0.627–0.645s (3.7%) | 0.033–0.040s (0.4–0.5%) |
+| splat (×8, CPU) | 1.028–1.046s (6.1%) | 0.963–1.048s (11.3–12.3%) |
+| fusionnet (×1) | 4.102–4.213s (24.4–24.5%) | 0.243–0.252s (2.9%) |
+| unaccounted (resize/concat/weighting) | 0.827–0.889s (4.9–5.1%) | 0.800–0.881s (9.4–10.3%) |
+| **total** | 16.730–17.290s | 8.524–8.532s |
+
+This corroborates the earlier ad hoc estimate (56–78%) rather than contradicting it, now
+with a reproducible source. The plan's estimate assumed CPU splat would dominate; in
+practice GMFlow's transformer-attention cost dominates instead, on both providers —
+splat stays under ~1.1s everywhere, so Phase 3's OpenCL splat kernel alone will not close
+the gap to the plan's fps target; GMFlow is the larger lever.
 
 \* MetricNet's legacy JIT exporter trips on `aten::l1_loss`; exported via `dynamo=True`
 instead. Its DirectML session needs `graph_optimization_level = ORT_DISABLE_ALL` — the
