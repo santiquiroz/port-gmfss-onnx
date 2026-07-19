@@ -1,0 +1,11 @@
+# Entorno CPU-only del toolkit de referencia GMFSS_Fortuna (variante PG/base).
+# SIN cupy en ningún lado -- softsplat corre por toolkit/vendor/gmfss_fortuna_98mxr/softsplat_torch.py
+# (pure PyTorch). Versiones modernas, sin pins legacy (a diferencia de port-audiosr-onnx).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+numpy
+onnx
+onnxruntime-directml
+opencv-python-headless
+scikit-image
+pytest
