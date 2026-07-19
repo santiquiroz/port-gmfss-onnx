@@ -12,3 +12,6 @@ onnxruntime-directml==1.24.4
 opencv-python-headless==5.0.0.93
 scikit-image==0.26.0
 pytest
+# Solo requerido por el exporter dynamo=True (Task 1.1: MetricNet trip la legacy JIT en
+# aten::l1_loss, ver toolkit/export_components.py) -- no lo usa run_reference.py.
+onnxscript==0.7.1

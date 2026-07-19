@@ -16,11 +16,20 @@ Numbers will be added here as each phase lands — measured on real hardware, ne
 
 ## Status
 
-| Component | Export | Parity | DirectML |
-|---|---|---|---|
-| Optical flow (GMFlow) | | | |
-| Synthesis / fusion network | | | |
-| numpy/onnxruntime driver | | | |
+| Component | Export | CPU-EP rel-err | DirectML rel-err | DirectML speedup |
+|---|---|---|---|---|
+| FeatureNet | done (opset 17, legacy) | 0.000000 | 0.000001 | 6.3–7.0x |
+| MetricNet | done (opset 18, dynamo)\* | 0.000001 | 0.000061 | 26–27x |
+| FusionNet (GridNet) | done (opset 17, legacy) | 0.000001 | 0.000001 | 20.5–22x |
+| Optical flow (GMFlow) | | | | |
+| numpy/onnxruntime driver | | | | |
+
+\* MetricNet's legacy JIT exporter trips on `aten::l1_loss`; exported via `dynamo=True`
+instead. Its DirectML session needs `graph_optimization_level = ORT_DISABLE_ALL` — the
+default fused DML kernel reproducibly hangs the GPU after ~3 calls on this hardware/driver
+(no correctness issue, values match; see `toolkit/validate_ort.py`). Numbers measured
+against real golden tensors from `refs/golden/` (RX 7800 XT, 3 validation pairs).
+Variant is "base" (no IFNet/RIFE — see `docs/vendored-sources.md`).
 
 ## Credits
 

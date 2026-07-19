@@ -1,5 +1,7 @@
 .venv/
 artifacts/*.onnx
+artifacts/*.onnx.data
+artifacts/*.npy
 refs/*.npy
 refs/golden/
 __pycache__/
