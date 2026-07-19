@@ -11,10 +11,13 @@ solo de la variante "union" que este port no usa):
   featurenet.onnx  FeatureNet.forward(img) -> (scale1, scale2, scale3)
   metricnet.onnx   MetricNet.forward(img0_half, img1_half, flow01, flow10) -> (metric0, metric1)
   fusionnet.onnx   GridNet.forward(fusion_rgb, fusion_feat1, fusion_feat2, fusion_feat3) -> raw_out
+  gmflow.onnx      GMFlow.forward(img0_half, img1_half) -> flow  (attn/corr/prop-radius lists y
+                   pred_bidir_flow=False horneados fijos como en gmfss_pg_pipeline.py; se llama
+                   dos veces en runtime con args swapeados para flow01/flow10 usando el mismo grafo)
 
 Shapes fijos a la resolucion objetivo 1920x1088 (1080p pad /64) -- sin dynamic_axes.
 
-Uso: .venv/Scripts/python.exe toolkit/export_components.py [featurenet metricnet fusionnet]
+Uso: .venv/Scripts/python.exe toolkit/export_components.py [featurenet metricnet fusionnet gmflow]
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from gmfss_pg_pipeline import _load_state_dict, resize_bilinear  # noqa: E402
 sys.path.insert(0, str(TOOLKIT_DIR / "vendor"))
 from vs_gmfss_fortuna.FeatureNet import FeatureNet  # noqa: E402
 from vs_gmfss_fortuna.FusionNet_b import GridNet  # noqa: E402
+from vs_gmfss_fortuna.gmflow.gmflow import GMFlow  # noqa: E402
 from vs_gmfss_fortuna.MetricNet import MetricNet  # noqa: E402
 
 ART.mkdir(exist_ok=True)
@@ -187,6 +191,37 @@ def build_fusionnet() -> GridNet:
     return net
 
 
+class GMFlowExportWrapper(nn.Module):
+    """Fija a inputs los defaults que gmfss_pg_pipeline.py usa en la llamada real
+    (`self.flownet(img0_half, img1_half)`, sin kwargs) -- attn_splits_list, corr_radius_list y
+    prop_radius_list quedan horneados como listas Python constantes, no como inputs del grafo,
+    y pred_bidir_flow=False elimina la rama de batch duplicado. El mismo grafo se llama dos
+    veces en runtime con img0/img1 swapeados para producir flow01 y flow10."""
+
+    def __init__(self, flownet: GMFlow) -> None:
+        super().__init__()
+        self.flownet = flownet
+
+    def forward(self, img0: torch.Tensor, img1: torch.Tensor) -> torch.Tensor:
+        return self.flownet(
+            img0,
+            img1,
+            attn_splits_list=[2, 8],
+            corr_radius_list=[-1, 4],
+            prop_radius_list=[-1, 1],
+            pred_bidir_flow=False,
+        )
+
+
+def build_gmflow() -> GMFlowExportWrapper:
+    net = GMFlow()
+    net.load_state_dict(_load_state_dict(MODELS_DIR / "flownet.pkl"))
+    net.eval()
+    wrapper = GMFlowExportWrapper(net)
+    wrapper.eval()
+    return wrapper
+
+
 def featurenet_output_names(which: str) -> list[str]:
     prefix = "feat0" if which == "0" else "feat1"
     return [f"{prefix}_scale1", f"{prefix}_scale2", f"{prefix}_scale3"]
@@ -277,10 +312,41 @@ def export_fusionnet(pairs: list[str]) -> None:
         add_extra_case(net, "fusionnet", f"case{i}", build_fusionnet_inputs(pair), refs)
 
 
+def build_gmflow_case(pair: str, direction: str) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """direction '01': flownet(img0_half, img1_half) -> flow01 (golden ref ya dumpeado en
+    fase 0). direction '10': mismo grafo, args swapeados -> flow10, exactamente como
+    gmfss_pg_pipeline.estimate_flow_and_metric() llama flownet() dos veces."""
+    if direction == "01":
+        inputs = [derive_img_half(pair, "0"), derive_img_half(pair, "1")]
+        refs = load_golden_outputs(pair, ["flow01"])
+    else:
+        inputs = [derive_img_half(pair, "1"), derive_img_half(pair, "0")]
+        refs = load_golden_outputs(pair, ["flow10"])
+    return inputs, refs
+
+
+def export_gmflow(pairs: list[str]) -> None:
+    net = build_gmflow()
+    primary = pairs[0]
+    inputs0, refs0 = build_gmflow_case(primary, "01")
+    export_graph(net, "gmflow", inputs0, ["img0_half", "img1_half"], ["flow"], refs0)
+
+    inputs1, refs1 = build_gmflow_case(primary, "10")
+    add_extra_case(net, "gmflow", "case1", inputs1, refs1)
+
+    case_id = 2
+    for pair in pairs[1:]:
+        for direction in ("01", "10"):
+            inputs, refs = build_gmflow_case(pair, direction)
+            add_extra_case(net, "gmflow", f"case{case_id}", inputs, refs)
+            case_id += 1
+
+
 GRAPH_EXPORTERS = {
     "featurenet": export_featurenet,
     "metricnet": export_metricnet,
     "fusionnet": export_fusionnet,
+    "gmflow": export_gmflow,
 }
 
 

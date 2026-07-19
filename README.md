@@ -21,7 +21,7 @@ Numbers will be added here as each phase lands — measured on real hardware, ne
 | FeatureNet | done (opset 17, legacy) | 0.000000 | 0.000001 | 6.3–7.0x |
 | MetricNet | done (opset 18, dynamo)\* | 0.000001 | 0.000061 | 26–27x |
 | FusionNet (GridNet) | done (opset 17, legacy) | 0.000001 | 0.000001 | 20.5–22x |
-| Optical flow (GMFlow) | | | | |
+| Optical flow (GMFlow) | done (opset 17, legacy) | 0.000415† | 0.000086 | 7.94x |
 | numpy/onnxruntime driver | | | | |
 
 \* MetricNet's legacy JIT exporter trips on `aten::l1_loss`; exported via `dynamo=True`
@@ -30,6 +30,17 @@ default fused DML kernel reproducibly hangs the GPU after ~3 calls on this hardw
 (no correctness issue, values match; see `toolkit/validate_ort.py`). Numbers measured
 against real golden tensors from `refs/golden/` (RX 7800 XT, 3 validation pairs).
 Variant is "base" (no IFNet/RIFE — see `docs/vendored-sources.md`).
+
+† GMFlow's legacy JIT exporter worked directly at opset 17 — no dynamo fallback needed,
+despite `F.unfold`, shifted-window `torch.roll`, and 4D `F.grid_sample` all appearing in
+the traced graph (swin attention + local correlation + flow warping). DirectML runs the
+single graph with no op rejections or crashes — no sub-graph split needed. rel-err is
+outlier-dominated (occlusion-boundary pixels): RMS rel-err is 0.000007–0.000029, ~15–60x
+smaller than the reported max rel-err, with under 0.06% of pixels driving the max on any
+case. The max-err gate (0.000415) already passes with margin under the 1e-3 threshold, so
+it is the reported/binding number — RMS is corroborating evidence, not a rescue. Both
+`flow01` and `flow10` directions validated (same graph/weights, swapped `img0`/`img1`
+args) across all 3 golden pairs (6 cases total).
 
 ## Credits
 

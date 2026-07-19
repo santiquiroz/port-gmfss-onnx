@@ -12,7 +12,7 @@ orden de reduccion en conv/grid_sample y no vale la pena que el gate sea fragil 
 Si DirectML falla (op no soportado, error de runtime) no es bloqueante: se reporta y se sigue
 (igual que el precedente de AudioSR), el assert duro es solo sobre CPU-EP.
 
-Uso: .venv/Scripts/python.exe toolkit/validate_ort.py [featurenet metricnet fusionnet]
+Uso: .venv/Scripts/python.exe toolkit/validate_ort.py [featurenet metricnet fusionnet gmflow]
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ART = ROOT / "artifacts"
 THIS_FILE = Path(__file__).resolve()
 
-GRAPHS = ["featurenet", "metricnet", "fusionnet"]
+GRAPHS = ["featurenet", "metricnet", "fusionnet", "gmflow"]
 CPU_REL_ERR_THRESHOLD = 1e-3
 DML_REL_ERR_THRESHOLD = 1e-2
 RESULT_LINE_PREFIX = "RESULT_JSON: "
