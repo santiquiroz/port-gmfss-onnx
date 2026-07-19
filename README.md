@@ -21,7 +21,7 @@ Numbers will be added here as each phase lands — measured on real hardware, ne
 | FeatureNet | done (opset 17, legacy) | 0.000000 | 0.000001 | 6.3–7.0x |
 | MetricNet | done (opset 18, dynamo)\* | 0.000001 | 0.000061 | 26–27x |
 | FusionNet (GridNet) | done (opset 17, legacy) | 0.000001 | 0.000001 | 20.5–22x |
-| Optical flow (GMFlow) | done (opset 17, legacy) | 0.000415† | 0.000086 | 7.94x |
+| Optical flow (GMFlow) | done (opset 17, legacy) | 0.000415† | 0.000086 | 7.77–7.94x |
 | numpy/onnxruntime driver | | | | |
 
 \* MetricNet's legacy JIT exporter trips on `aten::l1_loss`; exported via `dynamo=True`
