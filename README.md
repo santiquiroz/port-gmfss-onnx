@@ -3,6 +3,9 @@
 **First known ONNX port of [GMFSS_Fortuna](https://github.com/98mxr/GMFSS_Fortuna) — one of the best anime frame-interpolation models — running on *any* DirectX 12 GPU (AMD, Intel, NVIDIA), no CUDA required.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![ONNX opset](https://img.shields.io/badge/ONNX%20opset-17%20%7C%2018-005CED.svg)](artifacts/manifest.json)
+[![DirectML](https://img.shields.io/badge/DirectML-AMD%20%7C%20Intel%20%7C%20NVIDIA-0078D4.svg)](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB.svg)](toolkit/setup-env.ps1)
 
 ## Why this exists
 
@@ -13,6 +16,175 @@ Like most PyTorch research models, it only runs well with **CUDA**. Anyone on an
 **This project decomposes GMFSS_Fortuna into plain ONNX graphs** so the heavy compute runs through [onnxruntime](https://onnxruntime.ai/) on **any execution provider** — DirectML (any DX12 GPU: AMD Radeon, Intel Arc, NVIDIA), CUDA, or CPU. No torch at inference time, no CUDA lock-in.
 
 Numbers will be added here as each phase lands — measured on real hardware, never promised in advance.
+
+## How it works
+
+GMFSS_Fortuna interpolates a frame between two source frames (`img0`, `img1`) at one or more
+timesteps `t ∈ (0, 1)`. This port keeps the exact same computation, but splits it across two
+layers: 4 ONNX graphs for everything that maps cleanly onto onnxruntime ops, and a small Python
+driver for the one operation that doesn't.
+
+```mermaid
+flowchart TB
+    classDef onnx fill:#1f6feb,color:#fff,stroke:#1f6feb;
+    classDef driver fill:#57606a,color:#fff,stroke:#57606a;
+    classDef note fill:none,stroke:#d29922,stroke-dasharray:4 3,color:#9a6700;
+
+    Img["img0 / img1<br/>1x3x1088x1920"] --> FeatureNet
+    Img --> Half["resize_bilinear<br/>img0_half / img1_half<br/>1x3x544x960"]
+    Half --> GMFlow
+
+    FeatureNet["FeatureNet<br/>ONNX, opset 17"]:::onnx --> Splat
+    GMFlow["GMFlow<br/>ONNX, opset 17<br/>called x2: flow01, flow10"]:::onnx --> MetricNet
+    GMFlow --> Splat
+    MetricNet["MetricNet<br/>ONNX, opset 18 (dynamo)"]:::onnx --> Splat
+
+    Splat["softsplat x8<br/>driver/pipeline.py + driver/softsplat*.py<br/>numpy / torch-CPU by default<br/>optional OpenCL GPU backend"]:::driver --> FusionNet
+    FusionNet["FusionNet / GridNet<br/>ONNX, opset 17"]:::onnx --> Out["interpolated frame<br/>1x3x1088x1920"]
+
+    Note["Why softsplat is Python, not ONNX:<br/>DirectML rejects ScatterND with<br/>reduction='add' outright<br/>(driver/softsplat.py docstring)"]:::note -.-> Splat
+```
+
+**Pipeline** (`driver/pipeline.py`'s `GmfssDriver`, mirrors `toolkit/gmfss_pg_pipeline.py`'s
+reference composition — FeatureNet → GMFlow×2 → MetricNet → softsplat×8 → FusionNet):
+
+1. **FeatureNet** — run once per source image, produces a 3-level feature pyramid (scale1/2/3
+   = half/quarter/eighth of the padded resolution).
+2. **GMFlow** — one graph, called *twice* per pair with swapped inputs to get `flow01` and
+   `flow10` (bidirectional optical flow between the half-resolution images).
+3. **MetricNet** — run once per pair, consumes both flows, produces `metric0`/`metric1`
+   (per-pixel log-weights that resolve occlusion during splatting).
+4. **softsplat × 8** — forward-warps `img0_half`/`img1_half` and all 6 pyramid feature maps
+   toward timestep `t`, softmax-weighted by the metric. Runs in `driver/softsplat.py`
+   (numpy + torch-CPU) by default, or `driver/softsplat_cl.py` (hand-written OpenCL kernel) if
+   opted in — see [OpenCL splat kernel (Task 3.1)](#opencl-splat-kernel-task-31) above.
+5. **FusionNet (GridNet)** — run once per timestep, takes the splatted RGB + feature maps and
+   produces the final interpolated frame.
+
+**Why softsplat lives outside the ONNX graph**: it is the one operation in the whole pipeline
+that doesn't survive the trip to DirectML. As `driver/softsplat.py`'s own docstring puts it:
+*"DirectML rejects ScatterND with reduction="add" outright, which is why this needs a portable
+driver at all instead of running on DML."* Every other op in FeatureNet/GMFlow/MetricNet/
+FusionNet — including 4D `grid_sample`, shifted-window attention via `unfold`/`roll`, and
+`InstanceNorm2d` — maps onto DirectML with no rejection or sub-graph splitting required.
+softsplat is the sole holdout, which is why it's the only stage written in Python instead of an
+ONNX graph.
+
+**`reuse()` caching**: `GmfssDriver.interpolate_pair(img0, img1, timesteps)` calls `reuse()`
+exactly once regardless of how many timesteps are requested. `reuse()` computes everything that
+depends only on the image pair — both feature pyramids, both flow directions, both metrics —
+since none of that changes with `t`. Only the splat calls and the FusionNet pass are re-run per
+timestep. This matters because GMFlow's swin-attention alone is 55–74% of total pipeline time
+(see the Task 2.2 profiling below): interpolating 2 frames between the same pair (3x) costs
+roughly one extra splat+FusionNet pass, not a second full `reuse()`.
+
+**Fixed padded shape (1920×1088, `/64`)**: all 4 graphs are exported with fixed shapes, no
+`dynamic_axes` (`toolkit/export_components.py`). This is a deliberate tradeoff, not an
+oversight — GMFlow's shifted-window attention (`F.unfold`, `torch.roll`) and grid_sample warping
+are shape-sensitive enough that baking in one target resolution at trace time is far lower-risk
+than exporting dynamic shapes and hoping every op handles them identically at runtime.
+`GmfssDriver` enforces this: `reuse`/`interpolate_pair` raise `ValueError` if the input tensors
+aren't exactly `(1088, 1920)` (`assets.padded_hw`, sourced from `manifest.json`'s
+`resolution.fixed_padded_hw`). This driver does not resize frames for you — that's the caller's
+job. Upflow's `GmfssEngine` stretch-resizes each frame to the fixed padded shape on load, and
+stretch-resizes the output back to the original resolution on save (`_load_padded_frame`/
+`_save_frame` in `app/services/engines/gmfss_engine.py`) — arbitrary-resolution handling is
+explicitly out of scope for this driver itself (see `manifest.json`'s `resolution` note).
+
+**Timesteps**: `interpolate_pair(img0, img1, timesteps)` takes a list of floats in `(0, 1)`. 2x
+interpolation uses a single midpoint, `[0.5]`. 3x uses two evenly-spaced timesteps, `[1/3, 2/3]`.
+In general, for `n` extra frames between two source frames, timesteps are
+`[(i+1)/(n+1) for i in range(n)]` — this is how Upflow's engine computes them (`_pair_timesteps`
+in `gmfss_engine.py`); the driver itself has no opinion on timestep count or spacing, it just
+weights flow/metric by whatever `t` is passed (`F1t = t * flow01`, `F2t = (1-t) * flow10`, same
+pattern for the metric).
+
+## Usage
+
+### Toolkit setup
+
+```powershell
+pwsh -File toolkit/setup-env.ps1     # creates .venv (Python 3.11, CPU-only torch, no cupy)
+```
+
+Exporting or re-validating the graphs needs the vendored GMFSS_Fortuna weights (`.pkl` files,
+gitignored — see `docs/vendored-sources.md` for the exact upstream commits) and `refs/golden/`
+reference tensors (regenerate with `toolkit/run_reference.py`, see
+`docs/golden-reference-notes.md`). Neither is required to just *run* the published ONNX graphs
+— only to re-export or re-validate them yourself.
+
+```powershell
+# Export ONNX graphs (all 4, or a subset by name)
+.venv/Scripts/python.exe toolkit/export_components.py [featurenet metricnet fusionnet gmflow]
+
+# Validate each graph against golden tensors, CPU-EP and DirectML
+.venv/Scripts/python.exe toolkit/validate_ort.py [featurenet metricnet fusionnet gmflow]
+
+# Validate the assembled driver (all 4 graphs + softsplat), stage-by-stage and end-to-end
+.venv/Scripts/python.exe toolkit/validate_driver.py
+```
+
+### Using the driver standalone (no Upflow dependency)
+
+`driver/` has zero imports from `toolkit/` — it is designed to be vendored into any Python
+project as-is, given the published [`models-v1.0`](https://github.com/santiquiroz/port-gmfss-onnx/releases/tag/models-v1.0)
+release (`manifest.json` + 4 `.onnx` graphs + `metricnet.onnx.data`) and `onnxruntime`:
+
+```python
+from pathlib import Path
+
+import numpy as np
+import onnxruntime as ort
+
+from driver.assets import GRAPH_NAMES, GmfssAssets
+from driver.pipeline import GmfssDriver
+
+model_dir = Path("models")  # unzip the models-v1.0 release assets here
+assets = GmfssAssets.load(model_dir)
+
+# MetricNet's default fused DML kernel reproducibly hangs the GPU on this project's
+# validation hardware -- disabled on every graph, not just MetricNet's, in case the
+# same class of bug shows up elsewhere too (see manifest.json's metricnet note).
+session_options = ort.SessionOptions()
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+sessions = {
+    name: ort.InferenceSession(
+        str(assets.graph_path(name)), sess_options=session_options, providers=providers
+    )
+    for name in GRAPH_NAMES
+}
+
+
+def run_graph(name: str, feeds: dict[str, np.ndarray]) -> list[np.ndarray]:
+    return sessions[name].run(None, feeds)
+
+
+driver = GmfssDriver(assets, run_graph)  # splat_fn=None -> CPU driver.softsplat.splat_softmax
+
+height, width = assets.padded_hw  # (1088, 1920) -- fixed, see manifest.json
+# img0/img1: your own frames, already resized + normalized to uint8 RGB HWC -> /255.0 ->
+# float32 CHW [0, 1], batch dim 1 -- exactly (1, 3, height, width).
+img0 = np.zeros((1, 3, height, width), dtype=np.float32)
+img1 = np.zeros((1, 3, height, width), dtype=np.float32)
+
+frames = driver.interpolate_pair(img0, img1, timesteps=[0.5])  # 2x: one midpoint frame
+interpolated = frames[0]  # (1, 3, 1088, 1920) float32 [0, 1]
+```
+
+For the GPU splat backend, pass `splat_fn=driver.softsplat_cl.splat_softmax` to `GmfssDriver`
+(requires `pyopencl`, see `toolkit/requirements-gpu-splat.txt`; falls back to CPU automatically,
+with a one-time warning, if no working OpenCL GPU is present).
+
+### Real-world integration example
+
+This driver is vendored as-is into [Upflow](https://github.com/santiquiroz/upflow)
+(`app/services/engines/gmfss/` + `app/services/engines/gmfss_engine.py`), which wraps it with
+frame I/O (PNG load/resize/save), a session cache, threaded load/compute/save pipelining, and
+cancellation — the parts that are Upflow's job, not this repo's. **Upflow is a private
+repository**, so that link is informational context on how a real caller uses this driver, not
+something external readers can browse.
 
 ## Status
 
@@ -330,8 +502,31 @@ literal ≥1 fps gate, and this README does not pretend otherwise.
 
 ## Credits
 
-- **Model & weights:** [98mxr/GMFSS_Fortuna](https://github.com/98mxr/GMFSS_Fortuna) (MIT) — all the science is theirs. This repo is *only* the porting toolkit.
+- **Model & weights:** [98mxr/GMFSS_Fortuna](https://github.com/98mxr/GMFSS_Fortuna) (MIT) — all the science is theirs. Also the source of `model/softsplat_torch.py`, the pure-PyTorch (no cupy) softmax-splatting implementation this port's `driver/softsplat.py` is derived from. This repo is *only* the porting toolkit.
+- **Inference composition & weights:** [HolyWu/vs-gmfss_fortuna](https://github.com/HolyWu/vs-gmfss_fortuna) (MIT) — the clean, composable FeatureNet/MetricNet/FusionNet/GMFlow implementation and the committed `*_base.pkl` (PG/pg104) pretrained weights this port's ONNX exports are traced from. See `docs/vendored-sources.md` for exact vendored commits and file-by-file provenance.
+- **Optical flow architecture:** [GMFlow](https://github.com/haofeixu/gmflow) (Apache-2.0) — the transformer-attention optical flow model GMFSS_Fortuna builds on, vendored (via HolyWu's copy) as this port's `gmflow.onnx`.
+- **Softmax splatting (the algorithm, not the code):** Niklaus, S. and Liu, F., *"Softmax Splatting for Video Frame Interpolation"*, CVPR 2020. This port implements the algorithm independently in `driver/softsplat.py`, derived exclusively from 98mxr/GMFSS_Fortuna's `softsplat_torch.py` (MIT) — no code from `sniklaus/softmax-splatting` (the paper author's own reference implementation, non-commercial/academic license) was ever cloned, read, or referenced at any point in this project. This is a citation of the paper's existence, not a claim of code lineage from that repository.
 - Sibling ports: [port-audiosr-onnx](https://github.com/santiquiroz/port-audiosr-onnx) (audio super-resolution, same motivation and approach).
+
+## Contributing
+
+This project has only ever been benchmarked on one GPU (RX 7800 XT) — every fps/rel-err number
+above is real, but it's a sample size of one card. Contributions that would help most:
+
+- **Benchmarks on other GPUs**: Arc (Intel), RDNA2/RDNA4 (AMD), Ampere+ (NVIDIA). Same
+  methodology as this README — `toolkit/profile_pipeline.py` and `toolkit/validate_ort.py`/
+  `toolkit/validate_driver.py` are the scripts that produced every number here; run them on your
+  hardware and open an issue or PR with the output. No invented numbers, please — this project's
+  whole premise is measured-not-promised results.
+- **OpenCL splat kernel improvements**: the current kernel (`driver/kernels/splat.cl`) hits its
+  <20ms/call target only on the 2 lowest-channel-count call sites (see the
+  [Task 3.1](#opencl-splat-kernel-task-31) numbers above) — the 6 higher-channel feature-pyramid
+  calls are 1.0x–1.9x over CPU, not the 4.4x the low-channel calls get. Better work-item mapping,
+  local memory usage, or an entirely different accumulation strategy could close that gap.
+- **Driver ports to other languages/runtimes**: `driver/pipeline.py` and `driver/softsplat.py`
+  have a small, well-defined contract (`GraphRunner`/`SplatFn` protocols, documented I/O shapes
+  in `artifacts/manifest.json`) — a Rust, C++, or C# port consuming the same published ONNX
+  graphs is a self-contained, well-scoped contribution.
 
 ## License
 
