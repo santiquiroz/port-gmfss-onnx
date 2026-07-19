@@ -11,7 +11,12 @@ feed-forward-convnet stages instead of AudioSR's diffusion stages):
      request/response marshalling instead of raw onnxruntime calls.
   2. End-to-end: run the real `GmfssDriver.interpolate_pair()` (no golden substitution
      anywhere) and compare the final frame against refs/golden/<pair>/final_frame_padded.npy
-     by rel-err AND SSIM. This is the number that actually matters for shipping.
+     by rel-err AND SSIM. This is the number that actually matters for shipping. Run
+     against 3 configs: fp32 graphs (CPU-EP and DirectML), and -- since Task 3.2's actual
+     fastest/shipped config is fp16(fusionnet)+fp32(rest)+GPUsplat, not fp32-everything --
+     `main()` also runs this exact config end-to-end via `make_run_graph(...,
+     prefer_fp16=True)` + `gpu_splat_softmax`, so its rms-rel-err/SSIM claim is backed by
+     the config actually being exercised, not just the fp32 pass's numbers reused.
 
 Golden data was captured at a single timestep=0.5 (see refs/golden/meta.json) -- both
 validation passes therefore target timesteps=[0.5] only; GmfssDriver's support for other
@@ -298,6 +303,37 @@ def main() -> None:
     else:
         print("[DirectML+GPUsplat] SKIPPED: no working OpenCL GPU on this machine")
 
+    # fp16+GPUsplat is the actual shipped/fastest config (see README's "Final end-to-end
+    # fps" table) -- it needs its OWN end-to-end golden check, not a reuse of the fp32
+    # DirectML+GPUsplat numbers above. `dml_fp16_run_graph` is a fresh make_run_graph()
+    # instance (its own session cache) so this pass genuinely loads
+    # artifacts/fp16/fusionnet.onnx for fusionnet and fp32 for the other 3 graphs, exactly
+    # matching what toolkit/profile_pipeline.py's `--fp16` flag does -- fixes a review
+    # finding on Task 3.2: main() had the resolve_graph_path/prefer_fp16 machinery but
+    # never actually exercised prefer_fp16=True end-to-end, so the previously reported
+    # rms-rel-err/SSIM numbers for "the fp16 config" were actually fp32-everything's.
+    dml_fp16_gpu_splat_elapsed = None
+    if softsplat_cl._get_gpu_context() is not None:
+        dml_fp16_run_graph = make_run_graph(["DmlExecutionProvider"], prefer_fp16=True)
+        dml_fp16_gpu_splat_elapsed = validate_end_to_end(
+            PRIMARY_PAIR, dml_fp16_run_graph, DML_TOL, "DirectML+fp16+GPUsplat", splat_fn=gpu_splat_softmax
+        )
+    else:
+        print("[DirectML+fp16+GPUsplat] SKIPPED: no working OpenCL GPU on this machine")
+
+    if dml_fp16_gpu_splat_elapsed is not None:
+        print(
+            "    NOTE: the elapsed/fps printed just above for DirectML+fp16+GPUsplat is NOT "
+            "the authoritative speed number for this config -- by this point in main(), the "
+            "fp32 DirectML and DirectML+GPUsplat passes above have already created and left "
+            "resident several DirectML sessions in this same process, which the README's "
+            "'GMFlow discrepancy investigation' documents as a real DirectML/driver-level "
+            "contention source (see toolkit/investigate_dml_contention.py). This pass exists "
+            "for CORRECTNESS (rms-rel-err/SSIM), not speed; the authoritative fps for this "
+            "config comes from running toolkit/profile_pipeline.py --provider dml --splat "
+            "gpu --fp16 as its own process (see README's fps table)."
+        )
+
     print("\n[fps summary] end-to-end @1088x1920 (padded 1080p)")
     print(f"  graphs on CPU-EP, splat CPU:        {1.0 / cpu_elapsed:.3f} fps ({cpu_elapsed:.3f}s/frame)")
     print(f"  graphs on DML,    splat CPU:        {1.0 / dml_elapsed:.3f} fps ({dml_elapsed:.3f}s/frame)")
@@ -305,6 +341,11 @@ def main() -> None:
         print(
             f"  graphs on DML,    splat GPU (OpenCL): {1.0 / dml_gpu_splat_elapsed:.3f} fps "
             f"({dml_gpu_splat_elapsed:.3f}s/frame)"
+        )
+    if dml_fp16_gpu_splat_elapsed is not None:
+        print(
+            f"  graphs on DML fp16(fusionnet)+fp32(rest), splat GPU (OpenCL): "
+            f"{1.0 / dml_fp16_gpu_splat_elapsed:.3f} fps ({dml_fp16_gpu_splat_elapsed:.3f}s/frame)"
         )
 
     if FAILURES:

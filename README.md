@@ -168,13 +168,42 @@ Task 1.2's isolated `validate_ort.py` benchmark measured a single warmed GMFlow 
 GMFlow taking 6.09–6.35s for the 2 calls `reuse()` makes (flow01/flow10) — ~3.0–3.2s **per
 call**, roughly 5x the isolated number.
 
-Reproduced the gap in a minimal in-process repro (not a separate script — same process,
-same DML device, same real `vf_t006` tensors): an isolated GMFlow DML session, warmed and
-timed alone, measures 566–716ms/call (matches Task 1.2 exactly). The **same session**,
-timed again after `featurenet`+`gmflow`+`metricnet`+`fusionnet` DML sessions all exist
-concurrently in the process (mirroring exactly what `GmfssDriver`'s cached-session
-`run_graph` closure does across one `interpolate_pair()` call) measures 2925–3298ms/call —
-reproducing the real-world gap almost exactly. Ruled out as *not* the explanation:
+Originally reproduced via 3 throwaway scratchpad scripts (not committed to this repo) — an
+isolated GMFlow DML session, warmed and timed alone, measured 566–716ms/call (matches Task
+1.2 exactly); the **same session**, timed again after `featurenet`+`gmflow`+`metricnet`+
+`fusionnet` DML sessions all exist concurrently in the process (mirroring exactly what
+`GmfssDriver`'s cached-session `run_graph` closure does across one `interpolate_pair()`
+call), measured 2925–3298ms/call — reproducing the real-world gap almost exactly. This was
+flagged in review as the same "ad hoc, uncommitted, one-off instrumented run" issue
+`toolkit/profile_pipeline.py` already exists to fix for Task 2.2's GMFlow-percentage claim
+(see that module's docstring) — fixed here the same way: **`toolkit/investigate_dml_contention.py`**
+is a committed, re-runnable reproduction of the core "isolated fast, coexisting slow"
+comparison. Re-run today: an isolated raw gmflow DirectML session measures 324–329ms/call
+(reproduced twice); GMFlow's own per-call latency measured via
+`toolkit/profile_pipeline.py`'s stage timer, inside a real, fully-warmed
+`GmfssDriver.interpolate_pair()` call on DirectML (fp32, CPU splat — all 4 graph sessions
+created and warmed together, exactly what a real caller experiences), measures ~1483ms/call
+— a **4.5–4.6x slowdown**, reproduced twice. This confirms the same isolated-fast/
+coexisting-slow shape the original investigation found (~4.6–5.8x there), even though
+today's absolute numbers on both sides are roughly half of what was measured before —
+consistent with the broader run-to-run variance this section already documents further down
+(today's DirectML numbers run faster across the board, not specific to this contention
+measurement) — so the *ratio*, not the absolute ms, is this finding's stable signature.
+
+Building the committed reproduction surfaced one more fragility data point: an earlier
+version of `investigate_dml_contention.py` instead re-timed the SAME already-warm gmflow
+session object immediately after featurenet/metricnet/fusionnet sessions were built around
+it — mirroring the original scratch investigation's own methodology as literally as
+possible. That ordering reproducibly crashed the process with a segfault/access-violation on
+this hardware/driver on **every** attempt (2/2), including an ordering matched to the
+original investigation's own description of a *non*-crashing case (see below). That pattern
+was abandoned in favor of measuring GMFlow's coexisting latency through the real driver call
+path instead of raw session-object juggling — itself further evidence that this hardware/
+driver's multi-session DirectML behavior is genuinely fragile, not just slow.
+
+Ruled out as *not* the explanation (from the original investigation, not re-verified here
+since the review finding was about the core isolated/coexisting numbers and correctness
+claim, not these sub-checks):
 
 - **Insufficient warm-up**: 2 warm-up calls instead of 1 makes no difference (isolated
   stays 569–716ms either way).
@@ -257,11 +286,25 @@ warm-up call, then one timed call), `vf_t006`, RX 7800 XT:
 | DirectML fp16(fusionnet)+fp32(rest) | CPU | 2.61 | 0.383 |
 | **DirectML fp16(fusionnet)+fp32(rest)** | **GPU (OpenCL)** | **1.37–1.38** | **0.724–0.732** |
 
-Best configuration (bold row) validated for correctness end-to-end against golden data
-(`toolkit/validate_driver.py`'s `DirectML+GPUsplat` pass plus a dedicated fp16 check):
-rms-rel-err 0.000725 (tol 0.01, OK), SSIM 0.999861 (threshold 0.99, OK) — the speed comes
-with no meaningful quality loss. `toolkit/profile_pipeline.py --provider dml --splat gpu
---fp16` reproduces this.
+Best configuration (bold row) validated for correctness end-to-end against golden data by a
+**dedicated `DirectML+fp16+GPUsplat` pass in `toolkit/validate_driver.py`'s `main()`** —
+fixing a review finding: an earlier version of this script had the `resolve_graph_path`/
+`prefer_fp16` machinery but never actually called it with `prefer_fp16=True` end-to-end, so
+the previously reported correctness numbers for "the fp16 config" weren't verifiably from
+that exact config (they came from a fp32-everything+GPUsplat run instead). Running the real
+`prefer_fp16=True` + GPU-splat pass against golden data today: **rms-rel-err 0.000725 (tol
+0.01, OK), SSIM 0.999861 (threshold 0.99, OK)** — unchanged from what was previously
+reported, now backed by committed, re-runnable code instead of an unwired code path. The
+speed comes with no meaningful quality loss.
+
+Note: `validate_driver.py`'s own elapsed time for this pass is **not** a valid speed number
+for this config — by the time it runs (last in `main()`), the fp32 DirectML and
+DirectML+GPUsplat passes above it have already created and left resident several DirectML
+sessions in the same process, which is exactly the multi-session contention documented
+above; its own in-process fps reads a contention-inflated ~0.06 fps. `toolkit/
+profile_pipeline.py --provider dml --splat gpu --fp16`, run as its own process (only this
+config's 4 sessions ever created), is the authoritative fps source and was reconfirmed today
+at 1.400s/0.714fps — consistent with the 0.724–0.732 range in the table above.
 
 Two independent measurement scripts (`toolkit/profile_pipeline.py`'s own timer and
 `toolkit/validate_driver.py`'s own timer) agree within run-to-run noise on the fp32 rows
