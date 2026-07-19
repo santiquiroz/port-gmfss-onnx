@@ -2,10 +2,13 @@
 # SIN cupy en ningún lado -- softsplat corre por toolkit/vendor/gmfss_fortuna_98mxr/softsplat_torch.py
 # (pure PyTorch). Versiones modernas, sin pins legacy (a diferencia de port-audiosr-onnx).
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch
-numpy
-onnx
-onnxruntime-directml
-opencv-python-headless
-scikit-image
+# Versiones pineadas al resolver exacto usado para generar refs/golden/ (review Task 0.2):
+# regenerar la referencia dorada con otra versión de torch puede introducir drift
+# numérico que rompa el gate rel-err<1e-3 de las fases siguientes.
+torch==2.13.0+cpu
+numpy==2.4.6
+onnx==1.22.0
+onnxruntime-directml==1.24.4
+opencv-python-headless==5.0.0.93
+scikit-image==0.26.0
 pytest
