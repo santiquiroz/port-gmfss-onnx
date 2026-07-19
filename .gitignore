@@ -1,0 +1,8 @@
+.venv/
+artifacts/*.onnx
+refs/*.npy
+refs/golden/
+__pycache__/
+dist/
+*.pth
+*.pkl
