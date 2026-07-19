@@ -79,22 +79,60 @@ def as_tuple(value: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tens
     return value if isinstance(value, tuple) else (value,)
 
 
+def load_golden_outputs(pair: str, names: list[str]) -> list[torch.Tensor]:
+    """Carga los tensores de salida YA DUMPEADOS por fase 0 (run_reference.py) en
+    refs/golden/<pair>/*.npy -- estas son las refs de verdad para el gate de parity,
+    NO una pasada eager fresca de este script (ver Finding 1 del review de Task 1.1:
+    comparar el ONNX contra el propio eager de este script no prueba nada sobre bugs
+    de carga de pesos/estado-eval, porque ambos lados heredarian el mismo bug)."""
+    return [load_golden(pair, n) for n in names]
+
+
+EAGER_VS_GOLDEN_WARN_THRESHOLD = 1e-3
+
+
+def rel_err(actual: np.ndarray, expected: np.ndarray) -> float:
+    denom = np.abs(expected).max()
+    if denom == 0:
+        return float(np.abs(actual - expected).max())
+    return float(np.abs(actual - expected).max() / denom)
+
+
+def warn_if_eager_diverges_from_golden(
+    name: str,
+    case_id: str,
+    eager_outputs: tuple[torch.Tensor, ...],
+    golden_refs: list[torch.Tensor],
+) -> None:
+    """Sanity check independiente del gate de parity en validate_ort.py: compara la pasada
+    eager de ESTE script contra el output dorado de fase 0. Si diverge por encima del
+    umbral, es senal de un bug real (pesos, estado eval, version de modulo) -- se imprime,
+    no se silencia ni se usa para gatear el export."""
+    for i, (eager, golden) in enumerate(zip(eager_outputs, golden_refs)):
+        err = rel_err(eager.detach().cpu().numpy(), golden.detach().cpu().numpy())
+        status = "OK" if err < EAGER_VS_GOLDEN_WARN_THRESHOLD else "MISMATCH"
+        print(f"[export]   eager-vs-golden {name}/{case_id}/out{i}: rel-err={err:.6e} [{status}]", flush=True)
+
+
 def export_graph(
     module: nn.Module,
     name: str,
     inputs: list[torch.Tensor],
     input_names: list[str],
     output_names: list[str],
+    refs: list[torch.Tensor],
     dynamo: bool = False,
-) -> tuple[torch.Tensor, ...]:
+) -> None:
     """Exporta `module` a artifacts/<name>.onnx usando `inputs` como el caso "case0"
-    (el trace concreto que queda horneado en el grafo), y guarda ese caso como par
-    de validacion real."""
+    (el trace concreto que queda horneado en el grafo), y guarda ese caso -- con `refs`
+    (los outputs dorados REALES de fase 0, no una pasada eager fresca) -- como par de
+    validacion real para validate_ort.py."""
     path = ART / f"{name}.onnx"
     module.eval()
     with torch.no_grad():
-        outputs = as_tuple(module(*inputs))
-    save_case(name, "case0", inputs, list(outputs))
+        eager_outputs = as_tuple(module(*inputs))
+    warn_if_eager_diverges_from_golden(name, "case0", eager_outputs, refs)
+    save_case(name, "case0", inputs, refs)
     torch.onnx.export(
         module,
         tuple(inputs),
@@ -104,10 +142,9 @@ def export_graph(
         output_names=output_names,
         dynamo=dynamo,
     )
-    shapes = [tuple(o.shape) for o in outputs]
+    shapes = [tuple(r.shape) for r in refs]
     size_mb = path.stat().st_size / 1e6
     print(f"[export] {name}: {size_mb:.1f} MB, out shapes {shapes}, dynamo={dynamo}", flush=True)
-    return outputs
 
 
 def add_extra_case(
@@ -115,14 +152,17 @@ def add_extra_case(
     name: str,
     case_id: str,
     inputs: list[torch.Tensor],
+    refs: list[torch.Tensor],
 ) -> None:
-    """Corre `module` eager (mismo grafo ya exportado) sobre un caso REAL adicional
-    (otro par de refs/golden/, u otra rama del mismo par) y lo guarda para que
-    validate_ort.py verifique el .onnx exportado contra mas de un tensor real."""
+    """Guarda un caso REAL adicional (otro par de refs/golden/, u otra rama del mismo par)
+    contra su output dorado de fase 0 (`refs`), para que validate_ort.py verifique el .onnx
+    exportado contra mas de un tensor real. Corre el modulo eager solo como sanity check
+    diagnostico (warn_if_eager_diverges_from_golden) -- no se guarda ni se usa como ref."""
     module.eval()
     with torch.no_grad():
-        outputs = as_tuple(module(*inputs))
-    save_case(name, case_id, inputs, list(outputs))
+        eager_outputs = as_tuple(module(*inputs))
+    warn_if_eager_diverges_from_golden(name, case_id, eager_outputs, refs)
+    save_case(name, case_id, inputs, refs)
     print(f"[export]   + extra case {case_id} for {name}", flush=True)
 
 
@@ -147,21 +187,29 @@ def build_fusionnet() -> GridNet:
     return net
 
 
+def featurenet_output_names(which: str) -> list[str]:
+    prefix = "feat0" if which == "0" else "feat1"
+    return [f"{prefix}_scale1", f"{prefix}_scale2", f"{prefix}_scale3"]
+
+
 def export_featurenet(pairs: list[str]) -> None:
     net = build_featurenet()
     primary = pairs[0]
     img0 = load_golden(primary, "input_norm_img0")
-    export_graph(net, "featurenet", [img0], ["img"], ["scale1", "scale2", "scale3"])
+    refs0 = load_golden_outputs(primary, featurenet_output_names("0"))
+    export_graph(net, "featurenet", [img0], ["img"], ["scale1", "scale2", "scale3"], refs0)
 
     # img1 del mismo par: misma resolucion, mismo grafo, tensor real distinto.
     img1 = load_golden(primary, "input_norm_img1")
-    add_extra_case(net, "featurenet", "case1", [img1])
+    refs1 = load_golden_outputs(primary, featurenet_output_names("1"))
+    add_extra_case(net, "featurenet", "case1", [img1], refs1)
 
     case_id = 2
     for pair in pairs[1:]:
         for which in ("0", "1"):
             img = load_golden(pair, f"input_norm_img{which}")
-            add_extra_case(net, "featurenet", f"case{case_id}", [img])
+            refs = load_golden_outputs(pair, featurenet_output_names(which))
+            add_extra_case(net, "featurenet", f"case{case_id}", [img], refs)
             case_id += 1
 
 
@@ -186,10 +234,12 @@ def export_metricnet(pairs: list[str]) -> None:
         build_metricnet_inputs(primary),
         ["img0_half", "img1_half", "flow01", "flow10"],
         ["metric0", "metric1"],
+        load_golden_outputs(primary, ["metric0", "metric1"]),
         dynamo=True,
     )
     for i, pair in enumerate(pairs[1:], start=1):
-        add_extra_case(net, "metricnet", f"case{i}", build_metricnet_inputs(pair))
+        refs = load_golden_outputs(pair, ["metric0", "metric1"])
+        add_extra_case(net, "metricnet", f"case{i}", build_metricnet_inputs(pair), refs)
 
 
 def build_fusionnet_inputs(pair: str) -> list[torch.Tensor]:
@@ -220,9 +270,11 @@ def export_fusionnet(pairs: list[str]) -> None:
         build_fusionnet_inputs(primary),
         ["fusion_rgb", "fusion_feat1", "fusion_feat2", "fusion_feat3"],
         ["raw_out"],
+        load_golden_outputs(primary, ["fusionnet_out"]),
     )
     for i, pair in enumerate(pairs[1:], start=1):
-        add_extra_case(net, "fusionnet", f"case{i}", build_fusionnet_inputs(pair))
+        refs = load_golden_outputs(pair, ["fusionnet_out"])
+        add_extra_case(net, "fusionnet", f"case{i}", build_fusionnet_inputs(pair), refs)
 
 
 GRAPH_EXPORTERS = {

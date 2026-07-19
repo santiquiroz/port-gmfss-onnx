@@ -34,6 +34,11 @@ GRAPHS = ["featurenet", "metricnet", "fusionnet"]
 CPU_REL_ERR_THRESHOLD = 1e-3
 DML_REL_ERR_THRESHOLD = 1e-2
 RESULT_LINE_PREFIX = "RESULT_JSON: "
+# Defense-in-depth against *future* unknown hangs on other hardware/drivers (the known
+# DXGI_ERROR_DEVICE_HUNG cause is already worked around via ORT_DISABLE_ALL in
+# make_session). These are small feed-forward convnets -- CPU+DML together finish in low
+# single-digit seconds per graph, so 300s is generous headroom, not a tight budget.
+WORKER_TIMEOUT_SECONDS = 300
 
 
 def discover_cases(name: str) -> list[str]:
@@ -166,13 +171,20 @@ def run_graph_isolated(name: str) -> dict:
     "speedup", i.e. actually CPU) for FusionNet in-process. A fresh process per graph
     is what actually prevents that cross-contamination.
     """
-    proc = subprocess.run(
-        [sys.executable, str(THIS_FILE), "--worker", name],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(THIS_FILE), "--worker", name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=WORKER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{name}: worker subprocess hung and was killed after {WORKER_TIMEOUT_SECONDS}s "
+            f"(likely an unrecovered DirectML device hang -- see make_session docstring)"
+        ) from exc
     result = None
     for line in proc.stdout.splitlines():
         if line.startswith(RESULT_LINE_PREFIX):
