@@ -1,0 +1,154 @@
+{
+  "task": "2.2 - driver end-to-end (grafos ONNX + splat CPU) con parity total",
+  "model_variant": "base (PG/pg104, ver docs/vendored-sources.md)",
+  "license": "MIT",
+  "credits": [
+    "98mxr/GMFSS_Fortuna (MIT) -- softsplat_torch.py y arquitectura de referencia del pipeline",
+    "HolyWu/vs-gmfss_fortuna (MIT) -- FeatureNet, MetricNet, FusionNet_b (GridNet), GMFlow, pesos *_base.pkl"
+  ],
+  "vendored_commits": {
+    "HolyWu/vs-gmfss_fortuna": "f4f990a456678942beb7bcbca3fd5645d139ebe4",
+    "98mxr/GMFSS_Fortuna": "0fb7ac1dc292e2615217110dd9d82557845fb919"
+  },
+  "resolution": {
+    "fixed_padded_hw": [1088, 1920],
+    "note": "Graphs are traced/exported at this exact shape (no dynamic_axes) -- see toolkit/export_components.py. driver.pipeline.GmfssDriver.interpolate_pair operates ONLY at this fixed padded resolution and raises ValueError otherwise. Padding/cropping arbitrary input resolutions to a multiple of 64 (matching toolkit/gmfss_pg_pipeline.target_padded_size) is explicitly out of scope for this driver -- that is Phase 4's job when the driver is wired into Upflow's real video pipeline."
+  },
+  "input_normalization": "uint8 RGB HWC, /255.0 -> float32 CHW [0,1], batch dim 1. driver.pipeline does NOT perform this conversion itself -- callers must pass already-normalized+padded float32 [1,3,1088,1920] tensors, matching refs/golden/<pair>/input_norm_img{0,1}.npy exactly (see toolkit/gmfss_pg_pipeline.normalize_frame).",
+  "graphs": {
+    "featurenet": {
+      "file": "featurenet.onnx",
+      "opset": 17,
+      "exporter": "legacy JIT (dynamo=False)",
+      "inputs": { "img": [1, 3, 1088, 1920] },
+      "outputs": {
+        "scale1": [1, 64, 544, 960],
+        "scale2": [1, 128, 272, 480],
+        "scale3": [1, 192, 136, 240]
+      },
+      "note": "Called once per source image (img0, img1) inside reuse() -- full padded resolution in, half/quarter/eighth-resolution feature pyramid out. FeatureNet does its own internal stride-2 downsampling; it does NOT take img_half as input."
+    },
+    "gmflow": {
+      "file": "gmflow.onnx",
+      "opset": 17,
+      "exporter": "legacy JIT (dynamo=False)",
+      "inputs": {
+        "img0_half": [1, 3, 544, 960],
+        "img1_half": [1, 3, 544, 960]
+      },
+      "outputs": { "flow": [1, 2, 544, 960] },
+      "note": "Single graph, called twice per pair inside reuse() with swapped args: (img0_half, img1_half) -> flow01, (img1_half, img0_half) -> flow10. attn_splits_list=[2,8], corr_radius_list=[-1,4], prop_radius_list=[-1,1], pred_bidir_flow=False are baked into the traced graph (see toolkit/export_components.py GMFlowExportWrapper)."
+    },
+    "metricnet": {
+      "file": "metricnet.onnx",
+      "external_data_file": "metricnet.onnx.data",
+      "opset": 18,
+      "exporter": "dynamo=True (legacy JIT trips on aten::l1_loss)",
+      "inputs": {
+        "img0_half": [1, 3, 544, 960],
+        "img1_half": [1, 3, 544, 960],
+        "flow01": [1, 2, 544, 960],
+        "flow10": [1, 2, 544, 960]
+      },
+      "outputs": {
+        "metric0": [1, 1, 544, 960],
+        "metric1": [1, 1, 544, 960]
+      },
+      "note": "Called once per pair inside reuse(), after both GMFlow calls. DirectML sessions for this graph MUST set graph_optimization_level = ORT_DISABLE_ALL -- the default fused DML kernel reproducibly hung the GPU (DXGI_ERROR_DEVICE_HUNG) on the Task 1.1 validation hardware. See toolkit/validate_ort.py make_session()."
+    },
+    "fusionnet": {
+      "file": "fusionnet.onnx",
+      "opset": 17,
+      "exporter": "legacy JIT (dynamo=False)",
+      "inputs": {
+        "fusion_rgb": [1, 12, 544, 960],
+        "fusion_feat1": [1, 128, 544, 960],
+        "fusion_feat2": [1, 256, 272, 480],
+        "fusion_feat3": [1, 384, 136, 240]
+      },
+      "outputs": { "raw_out": [1, 3, 1088, 1920] },
+      "note": "Called once per requested timestep. fusion_rgb = concat([img0_half, splat_I1t, splat_I2t, img1_half], channel dim) -- 4x3=12 channels. fusion_featN = concat([splat_feat1tN, splat_feat2tN], channel dim). GridNet upsamples internally: half-res inputs -> full padded-res output. Driver clamps raw_out to [0,1] to get the final frame (matches refs/golden/<pair>/final_frame_padded.npy)."
+    }
+  },
+  "splat_calls": {
+    "impl": "driver.softsplat.splat_softmax (Task 2.1), strMode='soft' equivalent -- softmax-weighted forward warp, CPU-only (numpy in/out, torch-CPU internally). Never runs on DML: DirectML rejects ScatterND with reduction='add' outright, see driver/softsplat.py module docstring.",
+    "count_per_timestep": 8,
+    "order": [
+      {
+        "name": "I1t",
+        "inputs": "splat_softmax(img0_half, F1t, Z1t)",
+        "golden_ref": "splat_I1t.npy",
+        "feeds_fusion_rgb_slot": "channels [3:6]"
+      },
+      {
+        "name": "I2t",
+        "inputs": "splat_softmax(img1_half, F2t, Z2t)",
+        "golden_ref": "splat_I2t.npy",
+        "feeds_fusion_rgb_slot": "channels [6:9]"
+      },
+      {
+        "name": "feat1t1",
+        "inputs": "splat_softmax(feat0_scale1, F1t, Z1t)",
+        "golden_ref": "splat_feat1t1.npy",
+        "pyramid_level": 1,
+        "feeds_fusion_feat_slot": "fusion_feat1 channels [0:64]"
+      },
+      {
+        "name": "feat2t1",
+        "inputs": "splat_softmax(feat1_scale1, F2t, Z2t)",
+        "golden_ref": "splat_feat2t1.npy",
+        "pyramid_level": 1,
+        "feeds_fusion_feat_slot": "fusion_feat1 channels [64:128]"
+      },
+      {
+        "name": "feat1t2",
+        "inputs": "splat_softmax(feat0_scale2, resize(F1t, 0.5)*0.5, resize(Z1t, 0.5))",
+        "golden_ref": "splat_feat1t2.npy",
+        "pyramid_level": 2,
+        "feeds_fusion_feat_slot": "fusion_feat2 channels [0:128]"
+      },
+      {
+        "name": "feat2t2",
+        "inputs": "splat_softmax(feat1_scale2, resize(F2t, 0.5)*0.5, resize(Z2t, 0.5))",
+        "golden_ref": "splat_feat2t2.npy",
+        "pyramid_level": 2,
+        "feeds_fusion_feat_slot": "fusion_feat2 channels [128:256]"
+      },
+      {
+        "name": "feat1t3",
+        "inputs": "splat_softmax(feat0_scale3, resize(F1t, 0.25)*0.25, resize(Z1t, 0.25))",
+        "golden_ref": "splat_feat1t3.npy",
+        "pyramid_level": 3,
+        "feeds_fusion_feat_slot": "fusion_feat3 channels [0:192]"
+      },
+      {
+        "name": "feat2t3",
+        "inputs": "splat_softmax(feat1_scale3, resize(F2t, 0.25)*0.25, resize(Z2t, 0.25))",
+        "golden_ref": "splat_feat2t3.npy",
+        "pyramid_level": 3,
+        "feeds_fusion_feat_slot": "fusion_feat3 channels [192:384]"
+      }
+    ]
+  },
+  "pyramid_levels": [
+    { "level": 1, "scale": 1.0, "feature_source": "feat_scale1 (H/2,W/2 of full padded res == img_half res)", "flow_metric_resize": "none -- F1t/F2t/Z1t/Z2t are already at img_half resolution" },
+    { "level": 2, "scale": 0.5, "feature_source": "feat_scale2 (H/4,W/4 of full padded res)", "flow_metric_resize": "bilinear resize flow by 0.5 THEN multiply by 0.5 (a flow vector's magnitude is in pixels of its own resolution, so it must shrink with the resize); metric resized by 0.5 WITHOUT rescale (it is a log-weight, not a displacement)" },
+    { "level": 3, "scale": 0.25, "feature_source": "feat_scale3 (H/8,W/8 of full padded res)", "flow_metric_resize": "same pattern as level 2, factor 0.25" }
+  ],
+  "timestep_weighting": {
+    "F1t": "timestep * flow01",
+    "F2t": "(1 - timestep) * flow10",
+    "Z1t": "timestep * metric0",
+    "Z2t": "(1 - timestep) * metric1",
+    "note": "Pure scalar weighting, same code path for any timestep in [0,1]. Golden reference data (refs/golden/) was captured at a single timestep=0.5 only (see refs/golden/meta.json) -- validate_driver.py's parity gate therefore targets timesteps=[0.5]; GmfssDriver.interpolate_pair supporting other timestep values is exercised by tests/test_pipeline.py's fake-graph unit tests, not by golden-data parity (no golden data exists at other t)."
+  },
+  "run_graph_contract": "run_graph(name: str, feeds: dict[str, np.ndarray]) -> list[np.ndarray], outputs in the order documented under graphs.<name>.outputs above. Injected into GmfssDriver(assets, run_graph) -- production callers wrap onnxruntime.InferenceSession.run(None, feeds); tests inject fakes (see tests/test_pipeline.py).",
+  "required_files": [
+    "manifest.json",
+    "featurenet.onnx",
+    "gmflow.onnx",
+    "fusionnet.onnx",
+    "metricnet.onnx",
+    "metricnet.onnx.data"
+  ]
+}
