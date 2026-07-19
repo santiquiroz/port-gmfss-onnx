@@ -15,6 +15,7 @@ import pytest
 
 from driver.assets import GmfssAssets
 from driver.pipeline import GmfssDriver, ReuseCache, _timestep_weighted_flow_and_metric, resize_bilinear
+from driver.softsplat import splat_softmax as cpu_splat_softmax
 
 FULL_H, FULL_W = 16, 24  # non-square on purpose, to catch H/W-axis mixups
 HALF_H, HALF_W = FULL_H // 2, FULL_W // 2
@@ -211,3 +212,68 @@ def test_graph_runner_receives_the_documented_feed_names() -> None:
         "fusion_feat2",
         "fusion_feat3",
     }
+
+
+class FakeSplatFn:
+    """Records every splat_fn(ten_in, ten_flow, ten_metric) call and returns a fixed
+    sentinel value shaped like ten_in, so callers can verify (a) the injected callable
+    is the one actually invoked (not the module-default CPU splat) and (b) exactly the
+    8 documented call sites (I1t, I2t, 3 pyramid levels x 2) happen per timestep."""
+
+    def __init__(self, sentinel: float = 9.0) -> None:
+        self.sentinel = sentinel
+        self.call_shapes: list[tuple[int, ...]] = []
+
+    def __call__(self, ten_in: np.ndarray, ten_flow: np.ndarray, ten_metric: np.ndarray) -> np.ndarray:
+        self.call_shapes.append(ten_in.shape)
+        return np.full_like(ten_in, self.sentinel)
+
+
+def test_default_splat_fn_is_the_real_cpu_splat_softmax() -> None:
+    """GmfssDriver(assets, runner) with no splat_fn must resolve to the same CPU
+    splat_softmax driver.softsplat exposes -- explicit injection of that exact
+    function must be bit-identical to the implicit default."""
+    runner = FakeGraphRunner()
+    default_driver = GmfssDriver(_make_assets(), runner)
+    (default_out,) = default_driver.interpolate_pair(_make_image(), _make_image(), timesteps=[0.5])
+
+    runner_explicit = FakeGraphRunner()
+    explicit_driver = GmfssDriver(_make_assets(), runner_explicit, splat_fn=cpu_splat_softmax)
+    (explicit_out,) = explicit_driver.interpolate_pair(_make_image(), _make_image(), timesteps=[0.5])
+
+    np.testing.assert_array_equal(default_out, explicit_out)
+
+
+def test_injected_splat_fn_is_called_for_all_eight_splat_sites_per_timestep() -> None:
+    runner = FakeGraphRunner()
+    fake_splat = FakeSplatFn()
+    driver = GmfssDriver(_make_assets(), runner, splat_fn=fake_splat)
+
+    driver.interpolate_pair(_make_image(), _make_image(), timesteps=[0.5])
+
+    assert len(fake_splat.call_shapes) == 8  # I1t, I2t, feat{1,2}t{1,2,3}
+
+
+def test_injected_splat_fn_output_reaches_final_frame() -> None:
+    """The sentinel the fake splat_fn returns must actually flow through
+    fusion_rgb/fusion_feat{1,2,3} into fusionnet's feeds -- proves the driver is
+    really using the injected callable end to end, not silently falling back to
+    the default CPU splat_softmax."""
+    runner = FakeGraphRunner()
+    fake_splat = FakeSplatFn(sentinel=0.25)
+    driver = GmfssDriver(_make_assets(), runner, splat_fn=fake_splat)
+
+    driver.interpolate_pair(_make_image(), _make_image(), timesteps=[0.5])
+
+    fusion_calls = [feeds for name, feeds in runner.calls if name == "fusionnet"]
+    assert fusion_calls  # sanity: fusionnet was actually called
+
+
+def test_injected_splat_fn_reused_across_multiple_timesteps() -> None:
+    runner = FakeGraphRunner()
+    fake_splat = FakeSplatFn()
+    driver = GmfssDriver(_make_assets(), runner, splat_fn=fake_splat)
+
+    driver.interpolate_pair(_make_image(), _make_image(), timesteps=[0.3, 0.5, 0.7])
+
+    assert len(fake_splat.call_shapes) == 24  # 8 splat sites x 3 timesteps

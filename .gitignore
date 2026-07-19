@@ -2,6 +2,7 @@
 artifacts/*.onnx
 artifacts/*.onnx.data
 artifacts/*.npy
+artifacts/fp16/
 refs/*.npy
 refs/golden/
 __pycache__/

@@ -1,0 +1,13 @@
+# Optional extra for Task 3.2's fp16 conversion attempt (toolkit/convert_fp16.py,
+# toolkit/validate_fp16.py). NOT part of the base toolkit env (toolkit/requirements.txt)
+# and NOT a driver/ dependency -- fp16 graphs, where they exist, are plain .onnx files
+# consumed the same way as fp32 graphs (see driver/pipeline.py's `_f32` marshalling,
+# unchanged by keep_io_types=True conversion).
+#
+# Install into the toolkit venv with:
+#   .venv/Scripts/python.exe -m pip install -r toolkit/requirements-fp16.txt
+#
+# See README.md's "fp16 conversion attempt" section: only fusionnet.onnx converts to a
+# graph onnxruntime can load on this project's attempt -- featurenet/metricnet/gmflow hit
+# a reproducible onnxconverter-common bug, documented rather than force-fixed.
+onnxconverter-common==1.16.0

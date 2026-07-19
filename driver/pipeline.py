@@ -1,13 +1,25 @@
-"""Assembled GMFSS_Fortuna driver: 4 injected ONNX graphs + Task 2.1's `splat_softmax`.
+"""Assembled GMFSS_Fortuna driver: 4 injected ONNX graphs + an injectable softmax-splat
+backend (Task 2.1's CPU `driver.softsplat.splat_softmax` by default, Task 3.1's GPU
+`driver.softsplat_cl.splat_softmax` opt-in).
 
 Composition mirrors `toolkit/gmfss_pg_pipeline.py`'s `GMFSSBasePipeline` exactly
 (FeatureNet -> GMFlow x2 -> MetricNet -> softsplat x8 -> FusionNet), with two
 swaps: PyTorch module calls become `run_graph(name, feeds)` calls against
 injected ONNX sessions (real onnxruntime in production, fakes in tests --
 same injection pattern as AudioSrDriver in image-upscaler-amd), and
-`gmfss_pg_pipeline.warp()` becomes `driver.softsplat.splat_softmax`. See
-`artifacts/manifest.json` for the graph I/O contract and splat-call ordering
+`gmfss_pg_pipeline.warp()` becomes an injected `splat_fn` (see `SplatFn` below).
+See `artifacts/manifest.json` for the graph I/O contract and splat-call ordering
 this file implements.
+
+`GmfssDriver(assets, run_graph, splat_fn=None)` -- `splat_fn=None` (the default)
+resolves to this module's own `splat_softmax` name (CPU, imported from
+`driver.softsplat`) looked up dynamically on every call, which is what lets
+`toolkit/profile_pipeline.py` keep monkeypatching `pipeline.splat_softmax` for
+per-stage timing without any change here. Passing `splat_fn=driver.softsplat_cl.
+splat_softmax` (or any callable with the same signature) opts into the GPU
+backend -- same contract, same call sites, only the accumulation implementation
+changes. Backward compatible: every existing `GmfssDriver(assets, run_graph)`
+call site keeps using CPU splat exactly as before.
 
 Like `driver/softsplat.py`, this module has zero dependency on `toolkit/` --
 it can be vendored standalone into other projects (e.g. Upflow) as-is.
@@ -35,6 +47,16 @@ class GraphRunner(Protocol):
     multiple outputs, so this always returns a list rather than one array."""
 
     def __call__(self, name: str, feeds: dict[str, np.ndarray]) -> list[np.ndarray]: ...
+
+
+class SplatFn(Protocol):
+    """Same contract as `driver.softsplat.splat_softmax`/`driver.softsplat_cl.splat_softmax`:
+    forward-warp tenIn [N,C,H,W] by tenFlow [N,2,H,W], softmax-weighted+normalized by
+    tenMetric [N,1,H,W] -> [N,C,H,W]. Both implementations are drop-in interchangeable."""
+
+    def __call__(
+        self, ten_in: np.ndarray, ten_flow: np.ndarray, ten_metric: np.ndarray
+    ) -> np.ndarray: ...
 
 
 def resize_bilinear(array: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -73,9 +95,22 @@ class ReuseCache:
 
 
 class GmfssDriver:
-    def __init__(self, assets: GmfssAssets, run_graph: GraphRunner) -> None:
+    def __init__(
+        self,
+        assets: GmfssAssets,
+        run_graph: GraphRunner,
+        splat_fn: SplatFn | None = None,
+    ) -> None:
         self.assets = assets
         self.run_graph = run_graph
+        self.splat_fn = splat_fn
+
+    def _resolve_splat_fn(self) -> SplatFn:
+        # `splat_softmax` here is a free variable resolved against this module's
+        # globals at CALL time (not bound at __init__ time) -- this is what lets
+        # toolkit/profile_pipeline.py's `pipeline_module.splat_softmax = ...`
+        # monkeypatch keep working for the default (splat_fn=None) path.
+        return self.splat_fn if self.splat_fn is not None else splat_softmax
 
     def interpolate_pair(
         self, img0: np.ndarray, img1: np.ndarray, timesteps: list[float]
@@ -159,17 +194,18 @@ class GmfssDriver:
         return metric0, metric1
 
     def _forward_at_timestep(self, cache: ReuseCache, timestep: float) -> np.ndarray:
+        splat_fn = self._resolve_splat_fn()
         f1t, f2t, z1t, z2t = _timestep_weighted_flow_and_metric(cache, timestep)
 
-        i1t = splat_softmax(cache.img0_half, f1t, z1t)
-        i2t = splat_softmax(cache.img1_half, f2t, z2t)
+        i1t = splat_fn(cache.img0_half, f1t, z1t)
+        i2t = splat_fn(cache.img1_half, f2t, z2t)
 
         feat11, feat12, feat13 = cache.feat0
         feat21, feat22, feat23 = cache.feat1
 
-        feat1t1, feat2t1 = _splat_pyramid_level(feat11, feat21, f1t, f2t, z1t, z2t, scale=1.0)
-        feat1t2, feat2t2 = _splat_pyramid_level(feat12, feat22, f1t, f2t, z1t, z2t, scale=0.5)
-        feat1t3, feat2t3 = _splat_pyramid_level(feat13, feat23, f1t, f2t, z1t, z2t, scale=0.25)
+        feat1t1, feat2t1 = _splat_pyramid_level(feat11, feat21, f1t, f2t, z1t, z2t, scale=1.0, splat_fn=splat_fn)
+        feat1t2, feat2t2 = _splat_pyramid_level(feat12, feat22, f1t, f2t, z1t, z2t, scale=0.5, splat_fn=splat_fn)
+        feat1t3, feat2t3 = _splat_pyramid_level(feat13, feat23, f1t, f2t, z1t, z2t, scale=0.25, splat_fn=splat_fn)
 
         fusion_rgb = np.concatenate([cache.img0_half, i1t, i2t, cache.img1_half], axis=1)
         fusion_feat1 = np.concatenate([feat1t1, feat2t1], axis=1)
@@ -208,6 +244,7 @@ def _splat_pyramid_level(
     z0t: np.ndarray,
     z1t: np.ndarray,
     scale: float,
+    splat_fn: SplatFn,
 ) -> tuple[np.ndarray, np.ndarray]:
     """One of the 3 feature-pyramid splat pairs (6 of the 8 total splat calls).
     Mirrors GMFSSBasePipeline._splat_pyramid_level: at scale=1.0 the flow/metric
@@ -220,8 +257,8 @@ def _splat_pyramid_level(
         flow1t = _resize_flow(flow1t, scale)
         z0t = _resize_metric(z0t, scale)
         z1t = _resize_metric(z1t, scale)
-    splat0 = splat_softmax(feat0, flow0t, z0t)
-    splat1 = splat_softmax(feat1, flow1t, z1t)
+    splat0 = splat_fn(feat0, flow0t, z0t)
+    splat1 = splat_fn(feat1, flow1t, z1t)
     return splat0, splat1
 
 

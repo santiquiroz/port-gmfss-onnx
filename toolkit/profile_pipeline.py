@@ -23,11 +23,20 @@ allocation cost -- especially real on DirectML. This mirrors the existing
 precedent in validate_driver.py, where validate_stage_by_stage() already
 exercises every graph before validate_end_to_end() measures timing.
 
+`--splat {cpu,gpu}` (Task 3.2): selects driver.softsplat.splat_softmax (default) or
+driver.softsplat_cl.splat_softmax (OpenCL GPU, falls back to CPU with a warning if no
+working OpenCL GPU) via GmfssDriver's injectable splat_fn.
+
+`--fp16` (Task 3.2): uses artifacts/fp16/<name>.onnx wherever toolkit/convert_fp16.py
+produced a working conversion for that graph, fp32 for the rest (mixed precision) -- see
+toolkit/validate_driver.py's resolve_graph_path().
+
 Usage:
   .venv/Scripts/python.exe toolkit/profile_pipeline.py                # both providers
   .venv/Scripts/python.exe toolkit/profile_pipeline.py --provider cpu
   .venv/Scripts/python.exe toolkit/profile_pipeline.py --provider dml
   .venv/Scripts/python.exe toolkit/profile_pipeline.py --pair vs_t013
+  .venv/Scripts/python.exe toolkit/profile_pipeline.py --provider dml --splat gpu --fp16
 """
 
 from __future__ import annotations
@@ -49,6 +58,7 @@ from toolkit.validate_driver import make_run_graph, load, PRIMARY_PAIR  # noqa: 
 from driver.assets import GmfssAssets  # noqa: E402
 from driver import pipeline as pipeline_module  # noqa: E402
 from driver.pipeline import GmfssDriver  # noqa: E402
+from driver.softsplat_cl import splat_softmax as gpu_splat_softmax  # noqa: E402
 
 PROVIDER_EPS = {
     "cpu": ["CPUExecutionProvider"],
@@ -56,6 +66,7 @@ PROVIDER_EPS = {
 }
 PROVIDER_LABELS = {"cpu": "CPU-EP", "dml": "DirectML"}
 STAGE_ORDER = ("featurenet", "gmflow", "metricnet", "splat", "fusionnet")
+SPLAT_BACKENDS = {"cpu": None, "gpu": gpu_splat_softmax}
 
 
 class StageTimer:
@@ -90,22 +101,29 @@ def _timed_splat_softmax(timer: StageTimer, original):
     return wrapped
 
 
-def profile_provider(provider: str, pair: str) -> tuple[StageTimer, float]:
-    label = PROVIDER_LABELS[provider]
-    run_graph = make_run_graph(PROVIDER_EPS[provider])
+def profile_provider(
+    provider: str, pair: str, splat: str = "cpu", fp16: bool = False
+) -> tuple[StageTimer, float]:
+    label = f"{PROVIDER_LABELS[provider]}, splat={splat}{', fp16' if fp16 else ''}"
+    run_graph = make_run_graph(PROVIDER_EPS[provider], prefer_fp16=fp16)
     assets = GmfssAssets.load(ART)
+    splat_fn = SPLAT_BACKENDS[splat]
 
     img0 = load(pair, "input_norm_img0").astype(np.float32)
     img1 = load(pair, "input_norm_img1").astype(np.float32)
 
-    warmup_driver = GmfssDriver(assets, run_graph)
+    warmup_driver = GmfssDriver(assets, run_graph, splat_fn=splat_fn)
     warmup_driver.interpolate_pair(img0, img1, timesteps=[0.5])
 
     timer = StageTimer()
     original_splat = pipeline_module.splat_softmax
+    # Only meaningful when splat_fn=None (CPU default path -- see
+    # GmfssDriver._resolve_splat_fn); harmless no-op otherwise since an explicit
+    # splat_fn (GPU) bypasses this module-global lookup entirely, so timing the
+    # "splat" stage below still measures whichever backend is actually active.
     pipeline_module.splat_softmax = _timed_splat_softmax(timer, original_splat)
     try:
-        driver = GmfssDriver(assets, _timed_run_graph(run_graph, timer))
+        driver = GmfssDriver(assets, _timed_run_graph(run_graph, timer), splat_fn=_timed_splat_fn(timer, splat_fn))
         t0 = time.perf_counter()
         driver.interpolate_pair(img0, img1, timesteps=[0.5])
         total = time.perf_counter() - t0
@@ -114,6 +132,23 @@ def profile_provider(provider: str, pair: str) -> tuple[StageTimer, float]:
 
     print_breakdown(label, pair, timer, total)
     return timer, total
+
+
+def _timed_splat_fn(timer: StageTimer, splat_fn):
+    """Wraps an explicitly-injected splat_fn (e.g. GPU) with the same per-call timer
+    used for the default CPU path's module-global monkeypatch, so `splat` shows up in
+    the breakdown regardless of which backend is active. None means "use the driver's
+    own default resolution" (already timed via the module-global patch above)."""
+    if splat_fn is None:
+        return None
+
+    def wrapped(*args, **kwargs):
+        start = time.perf_counter()
+        result = splat_fn(*args, **kwargs)
+        timer.record("splat", time.perf_counter() - start)
+        return result
+
+    return wrapped
 
 
 def print_breakdown(label: str, pair: str, timer: StageTimer, total: float) -> None:
@@ -136,11 +171,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provider", choices=["cpu", "dml", "both"], default="both")
     parser.add_argument("--pair", default=PRIMARY_PAIR)
+    parser.add_argument("--splat", choices=["cpu", "gpu"], default="cpu")
+    parser.add_argument(
+        "--fp16", action="store_true", help="use artifacts/fp16/<name>.onnx where available (mixed precision)"
+    )
     args = parser.parse_args()
 
     providers = ["cpu", "dml"] if args.provider == "both" else [args.provider]
     for provider in providers:
-        profile_provider(provider, args.pair)
+        profile_provider(provider, args.pair, splat=args.splat, fp16=args.fp16)
 
 
 if __name__ == "__main__":

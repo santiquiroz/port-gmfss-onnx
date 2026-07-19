@@ -106,8 +106,10 @@ def make_session(path: Path, providers: list[str]) -> ort.InferenceSession:
     return ort.InferenceSession(str(path), sess_options=sess_options, providers=providers)
 
 
-def validate_provider(name: str, providers: list[str], label: str, cases: list[str]) -> tuple[float, float]:
-    path = ART / f"{name}.onnx"
+def validate_provider(
+    name: str, providers: list[str], label: str, cases: list[str], model_dir: Path = ART
+) -> tuple[float, float]:
+    path = model_dir / f"{name}.onnx"
     sess = make_session(path, providers)
     print(f"  [{label}]")
     max_err = 0.0

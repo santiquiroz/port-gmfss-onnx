@@ -16,6 +16,8 @@ Numbers will be added here as each phase lands — measured on real hardware, ne
 
 ## Status
 
+**Models**: published as GitHub release [`models-v1.0`](https://github.com/santiquiroz/port-gmfss-onnx/releases/tag/models-v1.0) — the 4 fp32 `.onnx` graphs + `metricnet.onnx.data` + `manifest.json`, plus one optional `fusionnet_fp16.onnx` (see fp16 section below).
+
 | Component | Export | CPU-EP rel-err | DirectML rel-err | DirectML speedup |
 |---|---|---|---|---|
 | FeatureNet | done (opset 17, legacy) | 0.000000 | 0.000001 | 6.3–7.0x |
@@ -155,6 +157,133 @@ case. The max-err gate (0.000415) already passes with margin under the 1e-3 thre
 it is the reported/binding number — RMS is corroborating evidence, not a rescue. Both
 `flow01` and `flow10` directions validated (same graph/weights, swapped `img0`/`img1`
 args) across all 3 golden pairs (6 cases total).
+
+### Bench end-to-end + decisión (Task 3.2)
+
+#### GMFlow discrepancy investigation
+
+Before trusting any final fps number, Task 3.2 root-caused a ~5x gap that looked suspicious:
+Task 1.2's isolated `validate_ort.py` benchmark measured a single warmed GMFlow DML call at
+618–645ms, but Task 2.2/3.1's assembled-pipeline profiler (`profile_pipeline.py`) measured
+GMFlow taking 6.09–6.35s for the 2 calls `reuse()` makes (flow01/flow10) — ~3.0–3.2s **per
+call**, roughly 5x the isolated number.
+
+Reproduced the gap in a minimal in-process repro (not a separate script — same process,
+same DML device, same real `vf_t006` tensors): an isolated GMFlow DML session, warmed and
+timed alone, measures 566–716ms/call (matches Task 1.2 exactly). The **same session**,
+timed again after `featurenet`+`gmflow`+`metricnet`+`fusionnet` DML sessions all exist
+concurrently in the process (mirroring exactly what `GmfssDriver`'s cached-session
+`run_graph` closure does across one `interpolate_pair()` call) measures 2925–3298ms/call —
+reproducing the real-world gap almost exactly. Ruled out as *not* the explanation:
+
+- **Insufficient warm-up**: 2 warm-up calls instead of 1 makes no difference (isolated
+  stays 569–716ms either way).
+- **Host↔device copy marshalling**: `IOBinding` (device-resident buffers) vs plain
+  `sess.run(numpy)` makes no difference in isolation (644–698ms either way).
+- **A general pipeline inefficiency**: CPU-EP shows *no* such gap — Task 1.2's isolated
+  CPU timing (4801–5049ms/call) already matches the assembled pipeline's CPU-EP per-call
+  cost (~4.6–4.8s/call from Task 2.2's profiler) almost exactly. The gap is DirectML/GPU-
+  session-specific, not a defect in `driver/pipeline.py` or the toolkit scripts.
+
+What *does* matter: **DirectML session creation order**. Creating `gmflow`'s session
+*before* `metricnet`/`fusionnet` exist (the real driver's own order: featurenet → gmflow →
+metricnet → fusionnet) and then calling it again after those later sessions are created
+reproduces the slowdown; creating `gmflow`'s session *last* (after the other 3 already
+exist) does not — that ordering stayed fast (650–730ms/call) with all 4 sessions resident.
+A further variant — timing an idle, already-warm `gmflow` session again immediately after
+3 new DirectML sessions get created — crashed with an access violation (`0xC0000005`), not
+just a slowdown. Taken together this points to genuine DirectML/driver-level resource
+contention (and some fragility) when multiple `onnxruntime-directml` sessions coexist in
+one process on this hardware/driver (RX 7800 XT), **not a bug in this repo's Python code**.
+
+**Not fixed**: the only real lever (sharing one explicit `ID3D12Device`/command queue
+across all 4 sessions) requires onnxruntime's lower-level C API, isn't exposed simply from
+the Python bindings, and the access-violation reproduction above shows this kind of
+multi-session juggling already carries real stability risk on this hardware — attempting
+it would not be the "small, scoped, well-tested change" this task calls for. Documented
+here instead, and the honest, contention-inclusive numbers (not the optimistic isolated
+618ms figure) are what's reported below — that's what a real caller experiences, since
+production always keeps all 4 graph sessions resident for reuse across frames.
+
+One genuinely useful, *serendipitous* confirmation of this root cause came out of the fp16
+work below: converting only `fusionnet` to fp16 (roughly halving that one session's
+resource footprint, 31.4MB → 15.8MB) measurably cut GMFlow's *own* assembled-pipeline
+latency too — from ~2.93s to ~0.66s for the 2 calls — even though GMFlow itself stayed
+fp32 the whole time. Reproduced twice (0.655s and 0.655s). This is further, independent
+evidence that cross-session GPU resource footprint (not just call count or one session's
+own compute) drives GMFlow's real-world DirectML latency here.
+
+#### fp16 conversion attempt
+
+Installed `onnxconverter-common` and converted all 4 graphs with
+`convert_float_to_float16(model, keep_io_types=True)` — the standard mixed-precision mode
+(inputs/outputs stay float32, so `driver/pipeline.py`'s existing `_f32` marshalling needs
+zero changes to consume an fp16 graph). Unlike AudioSR's UNet, none of the 4 graphs made
+the converter crash or hang. But 3 of 4 (`featurenet`, `metricnet`, `gmflow`) produce a
+graph `onnxruntime` refuses to *load* ("Type (tensor(float16)) ... does not match expected
+type (tensor(float))"). Root-caused, not just observed: this happens specifically where a
+tensor is **both** a declared graph output (kept float32 by `keep_io_types`) **and**
+consumed by further internal computation downstream (e.g. featurenet's `scale1` pyramid
+output also feeds later encoder blocks) — the converter's `Cast`-insertion bookkeeping
+leaves a stale/conflicting dtype on the internal consumer. Confirmed this is a real
+converter bug, not a fixable staleness issue on this repo's side: re-running
+`onnx.shape_inference.infer_shapes()` post-conversion does not resolve it; converting with
+`keep_io_types=False` *does* load cleanly, but that would require threading fp16 dtype
+through the *entire* driver end to end (`resize_bilinear`, both splat backends, every
+graph boundary) — a materially larger, riskier change than this task's "try it, document
+either way" scope. `toolkit/convert_fp16.py` verifies each converted graph actually loads
+in onnxruntime before keeping it, and deletes+reports any that doesn't, so a broken fp16
+file never silently ships.
+
+**Only `fusionnet` got a working fp16 conversion.** Validated against the real golden-
+derived cases (`toolkit/validate_fp16.py`, reuses `validate_ort.py`'s case/rel-err
+machinery): rel-err 0.0027–0.0041 across 3 cases, comfortably under this repo's existing
+1e-2 DirectML tolerance convention, 1.41–1.44x isolated DML speedup (172ms → 122ms). This
+is the one fp16 artifact published in `models-v1.0` (`fusionnet_fp16.onnx`) — `featurenet`,
+`metricnet`, `gmflow` stay fp32-only, exactly the brief's anticipated "converter se ahoga →
+fp32 y documentar" fallback, just per-graph rather than all-or-nothing.
+
+#### Final end-to-end fps @1080p 2x (t=0.5, matches the golden reference)
+
+Real `GmfssDriver.interpolate_pair()`, warmed-session methodology (same pattern
+`toolkit/validate_driver.py`/`toolkit/profile_pipeline.py` already use — one untimed
+warm-up call, then one timed call), `vf_t006`, RX 7800 XT:
+
+| Graphs | Splat | s/frame | fps |
+|---|---|---|---|
+| CPU-EP fp32 (reference) | CPU | 14.58–14.67 | 0.068–0.069 |
+| DirectML fp32 | CPU | 4.81–4.82 | 0.207–0.208 |
+| DirectML fp32 | GPU (OpenCL) | 3.68 | 0.272 |
+| DirectML fp16(fusionnet)+fp32(rest) | CPU | 2.61 | 0.383 |
+| **DirectML fp16(fusionnet)+fp32(rest)** | **GPU (OpenCL)** | **1.37–1.38** | **0.724–0.732** |
+
+Best configuration (bold row) validated for correctness end-to-end against golden data
+(`toolkit/validate_driver.py`'s `DirectML+GPUsplat` pass plus a dedicated fp16 check):
+rms-rel-err 0.000725 (tol 0.01, OK), SSIM 0.999861 (threshold 0.99, OK) — the speed comes
+with no meaningful quality loss. `toolkit/profile_pipeline.py --provider dml --splat gpu
+--fp16` reproduces this.
+
+Two independent measurement scripts (`toolkit/profile_pipeline.py`'s own timer and
+`toolkit/validate_driver.py`'s own timer) agree within run-to-run noise on the fp32 rows
+(4.805–4.822s vs 4.815s CPU-splat; 3.678s vs 3.799s GPU-splat). Note for anyone re-running
+this: these numbers are noticeably faster than Task 2.2/3.1's previously-documented
+DirectML figures earlier in this same README (6.09–6.35s for GMFlow's 2 calls back then
+vs ~2.92–2.94s now) — verified stable via 3 repeated measurements at the start of this
+session's *own* benchmarking (not drifting further with more runs), so it isn't simply
+"got faster the more we measured," but the underlying cause (sustained GPU/driver warm
+state vs a colder starting point in earlier sessions) wasn't chased further — it doesn't
+change today's honest, reproducible numbers, which are what's reported here.
+
+#### Kill-criterion verdict
+
+**Best measured fps: 0.72–0.73, below the plan's ≥1 fps @1080p threshold.**
+
+Per the brief: this is **GO anyway, not a failure** — GMFSS integrates into Phase 4 as a
+normal selectable engine, but the UI must eventually mark it **"Max quality (very slow)"**
+(a Phase 4 / Upflow-integration responsibility, not implemented in this repo). Reported
+honestly: 0.72–0.73 fps is a real, meaningful improvement over the pre-Phase-3 baseline
+(0.117 fps, Task 2.2) — roughly 6.2–6.3x faster — but it does not round up to "hit" the
+literal ≥1 fps gate, and this README does not pretend otherwise.
 
 ## Credits
 

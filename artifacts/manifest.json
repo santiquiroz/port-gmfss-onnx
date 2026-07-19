@@ -143,6 +143,17 @@
     "note": "Pure scalar weighting, same code path for any timestep in [0,1]. Golden reference data (refs/golden/) was captured at a single timestep=0.5 only (see refs/golden/meta.json) -- validate_driver.py's parity gate therefore targets timesteps=[0.5]; GmfssDriver.interpolate_pair supporting other timestep values is exercised by tests/test_pipeline.py's fake-graph unit tests, not by golden-data parity (no golden data exists at other t)."
   },
   "run_graph_contract": "run_graph(name: str, feeds: dict[str, np.ndarray]) -> list[np.ndarray], outputs in the order documented under graphs.<name>.outputs above. Injected into GmfssDriver(assets, run_graph) -- production callers wrap onnxruntime.InferenceSession.run(None, feeds); tests inject fakes (see tests/test_pipeline.py).",
+  "splat_backend_contract": "GmfssDriver(assets, run_graph, splat_fn=None) -- splat_fn=None (default) uses driver.softsplat.splat_softmax (CPU, numpy/torch-CPU). Pass splat_fn=driver.softsplat_cl.splat_softmax to opt into the OpenCL GPU backend (Task 3.1/3.2); same contract, falls back to CPU automatically with a one-time warning if no working OpenCL GPU is present. See driver/pipeline.py's SplatFn Protocol.",
+  "fp16_variants": {
+    "note": "Task 3.2 attempted onnxconverter-common fp16 conversion (keep_io_types=True mixed precision, see toolkit/convert_fp16.py) on all 4 graphs. Only fusionnet converts to a graph onnxruntime can actually load -- featurenet/metricnet/gmflow hit a reproducible onnxconverter-common bug (a value that is both a declared graph output and consumed by further internal computation gets a stale/conflicting dtype declaration onnxruntime rejects at load time). Documented, not forced through -- see README.md fp16 section and .superpowers/sdd/task-3.2-report.md.",
+    "fusionnet": {
+      "file": "fp16/fusionnet.onnx",
+      "keep_io_types": true,
+      "validated_rel_err_dml": "0.0027-0.0041 (3 golden cases, well under this repo's existing 1e-2 DirectML tolerance convention)",
+      "measured_dml_speedup_isolated": "1.41-1.44x (toolkit/validate_fp16.py, single-graph timing)",
+      "end_to_end_effect": "Also measurably reduces GMFlow's own per-call DirectML latency when all 4 sessions coexist in one process (see README's GMFlow multi-session-contention section) -- a smaller fusionnet session footprint appears to reduce cross-session GPU resource contention, not just fusionnet's own compute time."
+    }
+  },
   "required_files": [
     "manifest.json",
     "featurenet.onnx",
@@ -150,5 +161,6 @@
     "fusionnet.onnx",
     "metricnet.onnx",
     "metricnet.onnx.data"
-  ]
+  ],
+  "optional_files": ["fp16/fusionnet.onnx"]
 }

@@ -33,14 +33,17 @@ from skimage.metrics import structural_similarity
 
 ROOT = Path(__file__).resolve().parent.parent
 ART = ROOT / "artifacts"
+FP16_DIR = ART / "fp16"
 GOLDEN = ROOT / "refs" / "golden"
 
 sys.path.insert(0, str(ROOT))
 
 from toolkit.validate_ort import make_session  # noqa: E402
 from driver.assets import GmfssAssets  # noqa: E402
-from driver.pipeline import GmfssDriver, resize_bilinear, _resize_flow, _resize_metric  # noqa: E402
+from driver.pipeline import GmfssDriver, SplatFn, resize_bilinear, _resize_flow, _resize_metric  # noqa: E402
 from driver.softsplat import splat_softmax  # noqa: E402
+import driver.softsplat_cl as softsplat_cl  # noqa: E402
+from driver.softsplat_cl import splat_softmax as gpu_splat_softmax  # noqa: E402
 
 CPU_TOL = 1e-3
 DML_TOL = 1e-2  # matches toolkit/validate_ort.py's precedent for these same 4 graphs
@@ -122,12 +125,23 @@ def compute_ssim(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
     return float(structural_similarity(a_hwc, b_hwc, channel_axis=2, data_range=1.0))
 
 
-def make_run_graph(providers: list[str]):
+def resolve_graph_path(name: str, prefer_fp16: bool) -> Path:
+    """fp32 by default. `prefer_fp16=True` uses artifacts/fp16/<name>.onnx when that graph
+    has a working fp16 conversion (toolkit/convert_fp16.py only writes one when onnxruntime
+    can actually load it -- see that module's docstring for which graphs currently don't:
+    only fusionnet converts cleanly today), falling back to the fp32 graph for any graph
+    without one -- a real mixed-precision run, not an all-or-nothing switch."""
+    if prefer_fp16 and (FP16_DIR / f"{name}.onnx").exists():
+        return FP16_DIR / f"{name}.onnx"
+    return ART / f"{name}.onnx"
+
+
+def make_run_graph(providers: list[str], prefer_fp16: bool = False):
     sessions: dict[str, ort.InferenceSession] = {}
 
     def run_graph(name: str, feeds: dict[str, np.ndarray]) -> list[np.ndarray]:
         if name not in sessions:
-            sessions[name] = make_session(ART / f"{name}.onnx", providers)
+            sessions[name] = make_session(resolve_graph_path(name, prefer_fp16), providers)
         sess = sessions[name]
         feeds = {k: np.ascontiguousarray(v, dtype=np.float32) for k, v in feeds.items()}
         return sess.run(None, feeds)
@@ -239,10 +253,12 @@ def validate_stage_by_stage(pair: str, run_graph, tol: float, label: str) -> Non
     _check("final_frame_padded(from golden)", final, load(pair, "final_frame_padded"))
 
 
-def validate_end_to_end(pair: str, run_graph, tol: float, label: str) -> float:
+def validate_end_to_end(
+    pair: str, run_graph, tol: float, label: str, splat_fn: SplatFn | None = None
+) -> float:
     print(f"[{label}] end-to-end GmfssDriver.interpolate_pair, pair={pair}")
     assets = GmfssAssets.load(ART)
-    driver = GmfssDriver(assets, run_graph)
+    driver = GmfssDriver(assets, run_graph, splat_fn=splat_fn)
     img0 = load(pair, "input_norm_img0").astype(np.float32)
     img1 = load(pair, "input_norm_img1").astype(np.float32)
 
@@ -274,11 +290,22 @@ def main() -> None:
 
     dml_elapsed = validate_end_to_end(PRIMARY_PAIR, dml_run_graph, DML_TOL, "DirectML")
 
-    print("\n[fps summary] end-to-end @1088x1920 (padded 1080p), splat always CPU (numpy/torch-CPU)")
-    print(f"  graphs on CPU-EP: {1.0 / cpu_elapsed:.3f} fps ({cpu_elapsed:.3f}s/frame)")
-    print(f"  graphs on DML:    {1.0 / dml_elapsed:.3f} fps ({dml_elapsed:.3f}s/frame)")
-    print("  This is 'parity mode' -- Phase 3's OpenCL splat kernel is what's expected to")
-    print("  close the gap to real-time; these numbers are the pre-Phase-3 baseline.")
+    dml_gpu_splat_elapsed = None
+    if softsplat_cl._get_gpu_context() is not None:
+        dml_gpu_splat_elapsed = validate_end_to_end(
+            PRIMARY_PAIR, dml_run_graph, DML_TOL, "DirectML+GPUsplat", splat_fn=gpu_splat_softmax
+        )
+    else:
+        print("[DirectML+GPUsplat] SKIPPED: no working OpenCL GPU on this machine")
+
+    print("\n[fps summary] end-to-end @1088x1920 (padded 1080p)")
+    print(f"  graphs on CPU-EP, splat CPU:        {1.0 / cpu_elapsed:.3f} fps ({cpu_elapsed:.3f}s/frame)")
+    print(f"  graphs on DML,    splat CPU:        {1.0 / dml_elapsed:.3f} fps ({dml_elapsed:.3f}s/frame)")
+    if dml_gpu_splat_elapsed is not None:
+        print(
+            f"  graphs on DML,    splat GPU (OpenCL): {1.0 / dml_gpu_splat_elapsed:.3f} fps "
+            f"({dml_gpu_splat_elapsed:.3f}s/frame)"
+        )
 
     if FAILURES:
         print(f"\nPARITY FAILED: {FAILURES}")
