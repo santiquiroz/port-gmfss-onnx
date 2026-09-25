@@ -34,13 +34,16 @@ class FakeGraphRunner:
     """Deterministic stand-in for onnxruntime.InferenceSession.run, shaped to
     match real GMFSS conventions (featurenet downsamples by 2/4/8 internally;
     fusionnet upsamples half-res inputs back to full-res) without running any
-    real network. Records every call for control-flow assertions."""
+    real network. Records every call (feed names and feed arrays) for
+    control-flow and data-flow assertions."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[str, ...]]] = []
+        self.feeds: list[tuple[str, dict[str, np.ndarray]]] = []
 
     def __call__(self, name: str, feeds: dict[str, np.ndarray]) -> list[np.ndarray]:
         self.calls.append((name, tuple(feeds.keys())))
+        self.feeds.append((name, {key: value.copy() for key, value in feeds.items()}))
         handler = getattr(self, f"_{name}", None)
         if handler is None:
             raise ValueError(f"unexpected graph name {name!r}")
@@ -48,6 +51,9 @@ class FakeGraphRunner:
 
     def call_count(self, name: str) -> int:
         return sum(1 for call_name, _ in self.calls if call_name == name)
+
+    def feeds_for(self, name: str) -> list[dict[str, np.ndarray]]:
+        return [feeds for call_name, feeds in self.feeds if call_name == name]
 
     @staticmethod
     def _featurenet(feeds: dict[str, np.ndarray]) -> list[np.ndarray]:
@@ -80,6 +86,10 @@ class FakeGraphRunner:
 
 def _make_image() -> np.ndarray:
     return np.zeros((1, 3, FULL_H, FULL_W), dtype=np.float32)
+
+
+def _make_constant_image(value: float) -> np.ndarray:
+    return np.full((1, 3, FULL_H, FULL_W), value, dtype=np.float32)
 
 
 def test_reuse_calls_each_graph_the_expected_number_of_times() -> None:
@@ -259,14 +269,22 @@ def test_injected_splat_fn_output_reaches_final_frame() -> None:
     fusion_rgb/fusion_feat{1,2,3} into fusionnet's feeds -- proves the driver is
     really using the injected callable end to end, not silently falling back to
     the default CPU splat_softmax."""
+    sentinel, img0_value, img1_value = 0.25, 0.1, 0.7
+    img0 = _make_constant_image(img0_value)
+    img1 = _make_constant_image(img1_value)
     runner = FakeGraphRunner()
-    fake_splat = FakeSplatFn(sentinel=0.25)
-    driver = GmfssDriver(_make_assets(), runner, splat_fn=fake_splat)
+    driver = GmfssDriver(_make_assets(), runner, splat_fn=FakeSplatFn(sentinel=sentinel))
 
-    driver.interpolate_pair(_make_image(), _make_image(), timesteps=[0.5])
+    driver.interpolate_pair(img0, img1, timesteps=[0.5])
 
-    fusion_calls = [feeds for name, feeds in runner.calls if name == "fusionnet"]
-    assert fusion_calls  # sanity: fusionnet was actually called
+    (fusion_feeds,) = runner.feeds_for("fusionnet")
+    fusion_rgb = fusion_feeds["fusion_rgb"]
+    np.testing.assert_array_equal(fusion_rgb[:, 3:9], sentinel)  # I1t, I2t
+    for feed_name in ("fusion_feat1", "fusion_feat2", "fusion_feat3"):
+        np.testing.assert_array_equal(fusion_feeds[feed_name], sentinel)
+    # A constant image stays constant after the driver's half-res resize.
+    np.testing.assert_allclose(fusion_rgb[:, 0:3], img0_value, rtol=1e-6)
+    np.testing.assert_allclose(fusion_rgb[:, 9:12], img1_value, rtol=1e-6)
 
 
 def test_injected_splat_fn_reused_across_multiple_timesteps() -> None:
