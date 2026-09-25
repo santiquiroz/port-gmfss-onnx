@@ -1,9 +1,10 @@
 """Correctness + fallback tests for driver.softsplat_cl.splat_softmax (Task 3.1).
 
-Reuses tests/test_softsplat.py's real-call-site reconstruction (same 8 call
-sites x 3 golden pairs = 24 combinations that Task 2.1's suite already
-derives from refs/golden/ -- see that file's _build_real_call_sites for how
-each tensor triple is assembled from the pipeline's forward()).
+Reuses the real-call-site reconstruction shared with tests/test_softsplat.py
+(same 8 call sites x 3 golden pairs = 24 combinations that Task 2.1's suite
+already derives from refs/golden/ -- see tests/_golden_sites.py's
+build_real_call_sites for how each tensor triple is assembled from the
+pipeline's forward()).
 
 Ground truth here is driver.softsplat.splat_softmax (the CPU reference,
 already proven bit-exact vs the vendored PyTorch implementation), not the
@@ -32,9 +33,8 @@ import pytest
 import driver.softsplat_cl as softsplat_cl
 from driver.softsplat import splat_softmax as cpu_splat_softmax
 from driver.softsplat_cl import splat_softmax as gpu_splat_softmax
-from tests.test_softsplat import CALL_SITE_TO_GOLDEN, PAIRS, _build_real_call_sites
+from tests._golden_sites import REAL_CASES, build_real_call_sites
 
-REAL_CASES = [(pair, call_site) for pair in PAIRS for call_site in CALL_SITE_TO_GOLDEN]
 REL_ERR_TOLERANCE = 1e-5
 
 
@@ -57,9 +57,10 @@ def _require_real_gpu_for_correctness_tests(request):
 
 
 @pytest.mark.gpu_correctness
+@pytest.mark.requires_golden
 @pytest.mark.parametrize("pair,call_site", REAL_CASES)
 def test_gpu_kernel_matches_cpu_reference_within_rel_err(pair: str, call_site: str) -> None:
-    sites = _build_real_call_sites(pair)
+    sites = build_real_call_sites(pair)
     ten_in, ten_flow, ten_metric = sites[call_site]
     ten_in, ten_flow, ten_metric = ten_in.numpy(), ten_flow.numpy(), ten_metric.numpy()
 
@@ -130,6 +131,7 @@ def test_missing_pyopencl_warns_exactly_once_across_calls(monkeypatch, _reset_gp
     assert len(fallback_warnings) == 1
 
 
+@pytest.mark.gpu_correctness
 def test_falls_back_to_cpu_when_kernel_fails_to_compile(
     monkeypatch, tmp_path, _reset_gpu_module_state
 ) -> None:

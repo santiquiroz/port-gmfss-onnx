@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from driver.assets import GmfssAssets
 
 ART = Path(__file__).resolve().parent.parent / "artifacts"
@@ -27,6 +29,7 @@ def test_graph_path_resolves_onnx_file_under_model_dir() -> None:
     assert assets.graph_path("metricnet") == ART / "metricnet.onnx"
 
 
+@pytest.mark.requires_artifacts
 def test_is_complete_true_for_real_artifacts_dir() -> None:
     assert GmfssAssets.is_complete(ART) is True
 
