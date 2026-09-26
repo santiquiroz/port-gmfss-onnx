@@ -27,6 +27,7 @@ it can be vendored standalone into other projects (e.g. Upflow) as-is.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -34,8 +35,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from driver.assets import GmfssAssets
-from driver.softsplat import splat_softmax
+from .assets import GmfssAssets
+from .softsplat import splat_softmax
 
 FeaturePyramid = tuple[np.ndarray, np.ndarray, np.ndarray]
 
@@ -118,8 +119,17 @@ class GmfssDriver:
         """Runs reuse() exactly once regardless of len(timesteps); GMFSS's flow/feature
         extraction is the expensive part (10-15x slower than RIFE), so amortizing it
         across every requested intermediate frame is the point of this split."""
+        return list(self.iter_interpolated_pair(img0, img1, timesteps))
+
+    def iter_interpolated_pair(
+        self, img0: np.ndarray, img1: np.ndarray, timesteps: list[float]
+    ) -> Iterator[np.ndarray]:
+        """Lazy variant of interpolate_pair: reuse() once, then one frame per next().
+        Lets a streaming consumer apply backpressure instead of materializing every
+        intermediate frame of a many-timestep pair in RAM up front."""
         cache = self.reuse(img0, img1)
-        return [self._forward_at_timestep(cache, timestep) for timestep in timesteps]
+        for timestep in timesteps:
+            yield self._forward_at_timestep(cache, timestep)
 
     def reuse(self, img0: np.ndarray, img1: np.ndarray) -> ReuseCache:
         """Per-pair-independent-of-timestep computation: FeatureNet on both images,

@@ -28,7 +28,7 @@ from typing import Optional
 
 import numpy as np
 
-from driver.softsplat import splat_softmax as _splat_softmax_cpu
+from .softsplat import splat_softmax as _splat_softmax_cpu
 
 _KERNEL_PATH = Path(__file__).resolve().parent / "kernels" / "splat.cl"
 _NORMALIZE_EPS = 1e-7

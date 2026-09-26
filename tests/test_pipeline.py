@@ -146,6 +146,42 @@ def test_interpolate_pair_with_single_timestep_matches_multi_timestep_call_patte
     assert runner.call_count("fusionnet") == 1
 
 
+def test_iter_interpolated_pair_defers_fusionnet_until_first_next() -> None:
+    runner = FakeGraphRunner()
+    driver = GmfssDriver(_make_assets(), runner)
+
+    frames = driver.iter_interpolated_pair(_make_image(), _make_image(), timesteps=[0.3, 0.5, 0.7])
+    assert runner.call_count("fusionnet") == 0
+
+    next(frames)
+    assert runner.call_count("fusionnet") == 1
+
+
+def test_iter_interpolated_pair_runs_reuse_once_across_all_timesteps() -> None:
+    runner = FakeGraphRunner()
+    driver = GmfssDriver(_make_assets(), runner)
+
+    frames = list(driver.iter_interpolated_pair(_make_image(), _make_image(), timesteps=[0.3, 0.5, 0.7]))
+
+    assert len(frames) == 3
+    assert runner.call_count("featurenet") == 2
+    assert runner.call_count("gmflow") == 2
+    assert runner.call_count("metricnet") == 1
+    assert runner.call_count("fusionnet") == 3
+
+
+def test_interpolate_pair_matches_iter_interpolated_pair_frames() -> None:
+    img0, img1 = _make_constant_image(0.2), _make_constant_image(0.6)
+    timesteps = [0.25, 0.75]
+
+    eager = GmfssDriver(_make_assets(), FakeGraphRunner()).interpolate_pair(img0, img1, timesteps)
+    lazy = list(GmfssDriver(_make_assets(), FakeGraphRunner()).iter_interpolated_pair(img0, img1, timesteps))
+
+    assert len(eager) == len(lazy) == 2
+    for eager_frame, lazy_frame in zip(eager, lazy):
+        np.testing.assert_array_equal(eager_frame, lazy_frame)
+
+
 def test_forward_output_is_clamped_to_unit_range() -> None:
     runner = FakeGraphRunner()  # fusionnet fake returns a constant 1.5
     driver = GmfssDriver(_make_assets(), runner)
