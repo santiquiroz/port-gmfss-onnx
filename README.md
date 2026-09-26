@@ -13,9 +13,9 @@
 
 Like most PyTorch research models, it only runs well with **CUDA**. Anyone on an AMD or Intel GPU is stuck on CPU inference, which is impractical for video work, or has no path to run it at all inside a lightweight, torch-free application.
 
-**This project decomposes GMFSS_Fortuna into plain ONNX graphs** so the heavy compute runs through [onnxruntime](https://onnxruntime.ai/) on **any execution provider** — DirectML (any DX12 GPU: AMD Radeon, Intel Arc, NVIDIA), CUDA, or CPU. No torch at inference time, no CUDA lock-in.
+**This project decomposes GMFSS_Fortuna into plain ONNX graphs** so the heavy compute runs through [onnxruntime](https://onnxruntime.ai/) on **any execution provider** — DirectML (any DX12 GPU: AMD Radeon, Intel Arc, NVIDIA), CUDA, or CPU. No CUDA lock-in: the 4 networks need no torch at inference time; only the small Python driver still uses CPU-only torch, for bilinear resize and the softmax-splat scatter-add (see [How it works](#how-it-works)).
 
-Numbers will be added here as each phase lands — measured on real hardware, never promised in advance.
+Every number in this README was measured on real hardware, never promised in advance — per-graph parity, DirectML speedups and end-to-end fps are in [Status](#status) below (best so far: 0.72–0.73 fps @1080p 2x on an RX 7800 XT).
 
 ## How it works
 
@@ -57,7 +57,7 @@ reference composition — FeatureNet → GMFlow×2 → MetricNet → softsplat×
 4. **softsplat × 8** — forward-warps `img0_half`/`img1_half` and all 6 pyramid feature maps
    toward timestep `t`, softmax-weighted by the metric. Runs in `driver/softsplat.py`
    (numpy + torch-CPU) by default, or `driver/softsplat_cl.py` (hand-written OpenCL kernel) if
-   opted in — see [OpenCL splat kernel (Task 3.1)](#opencl-splat-kernel-task-31) above.
+   opted in — see [OpenCL splat kernel (Task 3.1)](#opencl-splat-kernel-task-31) below.
 5. **FusionNet (GridNet)** — run once per timestep, takes the splatted RGB + feature maps and
    produces the final interpolated frame.
 
@@ -188,7 +188,7 @@ something external readers can browse.
 
 ## Status
 
-**Models**: published as GitHub release [`models-v1.0`](https://github.com/santiquiroz/port-gmfss-onnx/releases/tag/models-v1.0) — the 4 fp32 `.onnx` graphs + `metricnet.onnx.data` + `manifest.json`, plus one optional `fusionnet_fp16.onnx` (see fp16 section below).
+**Models**: published as GitHub release [`models-v1.0`](https://github.com/santiquiroz/port-gmfss-onnx/releases/tag/models-v1.0) — the 4 fp32 `.onnx` graphs + `metricnet.onnx.data` + `manifest.json`, plus one optional `fusionnet_fp16.onnx` (see fp16 section below). The toolkit (`toolkit/convert_fp16.py`, `--fp16`/`prefer_fp16`) keeps that same graph at `artifacts/fp16/fusionnet.onnx`, so place a downloaded `fusionnet_fp16.onnx` there to use it with the toolkit.
 
 | Component | Export | CPU-EP rel-err | DirectML rel-err | DirectML speedup |
 |---|---|---|---|---|
@@ -227,8 +227,8 @@ networks compounds a handful of occlusion-boundary outlier pixels (≈0.02% of p
 exceed 1e-3; mean abs diff ≈2e-6) — the same outlier-pixel-dominated pattern already noted
 above for GMFlow alone, just visible again after 4x chaining. Max-abs-rel-err (0.006–0.086
 across pairs/providers) is printed for transparency but is informational, not gating; RMS
-and SSIM are the metrics that reflect true whole-frame fidelity here. See
-`.superpowers/sdd/task-2.2-report.md` for the full breakdown.
+and SSIM are the metrics that reflect true whole-frame fidelity here. Run
+`toolkit/validate_driver.py` to reproduce the per-stage and end-to-end numbers above.
 
 **Measured fps @1080p (1088×1920 padded), splat always CPU** — "parity mode", pre-Phase-3
 OpenCL splat kernel:
@@ -299,12 +299,11 @@ feature-pyramid calls (64–192 channels) miss it. Root cause: kernel time scale
 atomic-op count (`channels × H × W`), not resolution alone, and roughly half of the
 higher-channel calls' wall time is the numpy `exp`/multiply/concat/normalize pre- and
 post-processing around the kernel (kept in Python per this task's design, mirroring
-`driver/softsplat.py` — see the report below for the upload/kernel/download/numpy
-breakdown). Aggregate across all 8 real calls/frame: ≈555ms GPU vs ≈950–1050ms CPU at
+`driver/softsplat.py`). Aggregate across all 8 real calls/frame: ≈555ms GPU vs ≈950–1050ms CPU at
 matching synthetic shapes (≈1.7–1.9x), consistent with the ≈1.03–1.05s CPU total already
 measured on real tensors above. This is not a hard gate for Task 3.1 (Task 3.2 owns the
-actual kill-criterion) — reported honestly per the task brief. Full breakdown, commands,
-and diagnosis: `.superpowers/sdd/task-3.1-report.md`.
+actual kill-criterion) — reported honestly per the task brief. Reproduce with `toolkit/bench_splat_cl.py`
+(kernel timings) and `tests/test_softsplat_cl.py` (correctness).
 
 Not judged "OpenCL decepciona" (the plan's condition for the documented ONNX-ScatterND
 Alternative B, not implemented): the kernel is still a real, reproducible net win over CPU

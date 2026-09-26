@@ -99,7 +99,7 @@ def check_end_to_end(name: str, got: np.ndarray, ref: np.ndarray, rms_tol: float
     stages -- the real GmfssDriver.interpolate_pair() call), a handful of
     occlusion-boundary pixels compound across the 4-network chain and can push
     max-abs-rel-err past 1e-3 even though the bulk of the frame stays essentially
-    bit-identical. Empirically (see task-2.2-report.md): ~0.02% of pixel-values
+    bit-identical. Empirically (README's Task 2.2 section): ~0.02% of pixel-values
     exceed 1e-3, mean abs diff ~2e-6 -- the same outlier-pixel-dominated pattern
     this repo's README already documents for GMFlow alone (a single graph, no
     chaining). RMS-rel-err is the metric that reflects whole-frame fidelity here;

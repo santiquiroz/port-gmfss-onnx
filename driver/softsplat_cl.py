@@ -16,8 +16,9 @@ OpenCL device is available, every call transparently falls back to
 `driver.softsplat.splat_softmax` (the bit-exact CPU reference) after
 printing a warning exactly once -- not once per call.
 
-Like driver/softsplat.py, this module depends only on numpy (+ optional
-pyopencl) and driver.softsplat, so it can be vendored standalone.
+Its own imports are numpy, optional pyopencl and driver.softsplat, which in
+turn needs CPU-only torch -- so it vendors together with driver/softsplat.py
+(plus driver/kernels/splat.cl), never on its own.
 """
 
 from __future__ import annotations

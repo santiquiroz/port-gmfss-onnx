@@ -65,3 +65,20 @@ def test_is_complete_false_for_corrupt_manifest(tmp_path: Path) -> None:
     (tmp_path / "manifest.json").write_text("{not valid json", encoding="utf-8")
 
     assert GmfssAssets.is_complete(tmp_path) is False
+
+
+def test_manifest_file_entries_are_flat_release_asset_names() -> None:
+    # The published models-v1.0 release is a flat list of assets; a subdirectory in
+    # any manifest file entry names a file no downloader of the release can find.
+    manifest = json.loads((ART / "manifest.json").read_text(encoding="utf-8"))
+    fp16_files = [v["file"] for v in manifest["fp16_variants"].values() if isinstance(v, dict)]
+    listed = manifest["required_files"] + manifest["optional_files"] + fp16_files
+
+    assert [name for name in listed if "/" in name or "\\" in name] == []
+
+
+def test_manifest_optional_files_cover_every_fp16_variant() -> None:
+    manifest = json.loads((ART / "manifest.json").read_text(encoding="utf-8"))
+    fp16_files = {v["file"] for v in manifest["fp16_variants"].values() if isinstance(v, dict)}
+
+    assert fp16_files <= set(manifest["optional_files"])

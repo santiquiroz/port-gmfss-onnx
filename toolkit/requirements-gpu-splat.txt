@@ -9,7 +9,7 @@
 #   .venv/Scripts/python.exe -m pip install -r toolkit/requirements-gpu-splat.txt
 #
 # Requires an OpenCL 1.1+ ICD/driver for the target GPU to actually be usable
-# at runtime (pip install alone does not provide one) -- see
-# .superpowers/sdd/task-3.1-report.md for the AMD driver this was validated
-# against.
+# at runtime (pip install alone does not provide one). Validated only on an
+# AMD RX 7800 XT through its vendor OpenCL 2.1 driver -- see README's
+# "OpenCL splat kernel (Task 3.1)" section.
 pyopencl==2026.1.2
